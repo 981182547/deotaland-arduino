@@ -33,7 +33,7 @@ typedef enum {
     AGENT_CAP_SENSOR    = 1u << 7,  // General-purpose sensors (temp/humidity/light/PIR/gas…)
     AGENT_CAP_ACTUATOR  = 1u << 8,  // General-purpose actuators (GPIO/servo/relay…)
     AGENT_CAP_RECORDING = 1u << 9,  // Recording to storage + upload (meetings/memos)
-    AGENT_CAP_CAMERA    = 1u << 10, // Camera (video capture/upload; currently WiFi-only)
+    AGENT_CAP_CAMERA    = 1u << 10, // Camera (BLE still-image CoC; future WiFi video)
 } agent_cap_t;
 
 /**
@@ -46,7 +46,8 @@ typedef enum {
     AGENT_EVT_BUTTON   = 1,    ///< Button: data suggested as {uint8 button_id, uint8 action}
     AGENT_EVT_SENSOR   = 2,    ///< Sensor reading: data is device-specific (JSON or TLV recommended)
     AGENT_EVT_WAKEWORD = 3,    ///< Wake word detected: data may include the matched word
-    AGENT_EVT_CUSTOM   = 100,  ///< Device-private events (user-defined, 0x64+)
+    AGENT_EVT_PROMPT = 0x04, ///< Firmware-authored UTF-8 prompt
+    AGENT_EVT_CUSTOM   = 100,  ///< Device-private payload on event 0x64
 } agent_event_t;
 
 /**
@@ -58,7 +59,7 @@ typedef enum {
 typedef enum {
     AGENT_STATE_DISCONNECTED = 0,  //Not connected to Agent platform
     AGENT_STATE_CONNECTED,   // Link established (unencrypted)
-    AGENT_STATE_READY,       // Encrypted + capability handshake complete, ready for data
+    AGENT_STATE_READY,       // Event channel usable (BLE peer subscribed to notifications)
 } agent_state_t;
 
 #ifdef __cplusplus

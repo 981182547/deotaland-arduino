@@ -1,4 +1,7 @@
 #pragma once
+#ifndef AGENT_LINK_READING_CACHE_BYTES
+#define AGENT_LINK_READING_CACHE_BYTES 125u
+#endif
 /**
  * @file agent_link_io.h
  * @brief Generic device I/O: arbitrary sensor reporting and arbitrary actuator control.
@@ -16,12 +19,12 @@
  *               registered agent_io_actuate_cb_t callback.
  *          Semantics ("temperature", "buzzer") live only in the description
  *          strings; the SDK moves bytes and routes by id, so adding a new sensor
- *          needs no SDK changes. See docs/device-io.md. Rich media (screen,
+ *          needs no SDK changes. See docs/BEGINNER-GUIDE.zh-CN.md. Rich media (screen,
  *          speaker, camera) still use the dedicated callbacks in agent_link.h.
  */
 #include <stddef.h>
 #include <stdint.h>
-#include "esp_err.h"
+#include "agent_link_platform.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -97,8 +100,9 @@ typedef void (*agent_io_actuate_cb_t)(const char* id, const uint8_t* args, size_
  * @param cb   Actuator command handler; pass NULL for sensors.
  * @param ctx  User context passed back to @p cb.
  * @return ESP_OK on success, error code otherwise.
- * @note Call before agent_link_start(). The SDK serializes all registered
- *       endpoints into a manifest sent to the Agent on connect.
+ * @note Prefer registration before start. Registration while running advances
+ *       the revision and schedules a fresh manifest. Descriptors remain borrowed;
+ *       after changing one in place, call notify_manifest_changed().
  */
 esp_err_t agent_link_register_io(const agent_link_io_desc_t* desc,
                                  agent_io_actuate_cb_t cb, void* ctx);
@@ -106,13 +110,31 @@ esp_err_t agent_link_register_io(const agent_link_io_desc_t* desc,
 /**
  * @brief Report one sensor reading (by id + typed value).
  * @param id    Endpoint id.
- * @param value Pointer to data matching this endpoint's agent_val_t.
+ * @param value Non-NULL data matching agent_val_t; multi-byte numbers are little-endian.
  * @param len   Value length in bytes.
  * @return ESP_OK on success, error code otherwise.
  * @note Small readings go over the control plane; aggregate high-rate batches
  *       before calling (a data-plane path may be added later).
  */
 esp_err_t agent_link_push_reading(const char* id, const void* value, size_t len);
+
+/** Cache the newest sample, including while offline, and schedule nonblocking send.
+ * Multiple updates coalesce. Max AGENT_LINK_READING_CACHE_BYTES; no allocation.
+ * OFF retains for GetReading only; PERIODIC publishes the latest sample at the
+ * configured rate; ONCHANGE compares exact bytes. Actual sampling belongs to the
+ * application. BOOL is 0/1; F32/VEC2/VEC3 must be finite. Empty STR is allowed
+ * with a non-NULL value pointer. No other zero-length reading is accepted.
+ * Cached acceptance is not delivery: reports and queries must still fit the
+ * control MTU. Background send errors are recorded in stats.last_error. */
+esp_err_t agent_link_update_reading(const char* id, const void* value, size_t len);
+
+/** Like update_reading, but also checks the registered type before caching.
+ * A type mismatch returns INVALID_ARG even when both types have the same width.
+ * BOOL accepts only 0/1; F32/VEC2/VEC3 reject NaN/Inf. STR may be empty (len=0,
+ * value still non-NULL); the terminating NUL is not part of a string reading.
+ * Neither range hints nor args_schema/enum_json are runtime validators. */
+esp_err_t agent_link_update_reading_typed(const char* id, agent_val_t type,
+                                          const void* value, size_t len);
 
 /**
  * @brief Notify the Agent that the I/O manifest changed at runtime.

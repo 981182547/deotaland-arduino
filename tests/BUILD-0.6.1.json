@@ -1,0 +1,92 @@
+[
+  {
+    "Example": "ResponsiveLoop",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1295352,
+    "StaticRamBytes": 95688,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\ResponsiveLoop.log"
+  },
+  {
+    "Example": "ImageStream",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1311020,
+    "StaticRamBytes": 95672,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\ImageStream.log"
+  },
+  {
+    "Example": "RealtimeASR",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1311520,
+    "StaticRamBytes": 95744,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\RealtimeASR.log"
+  },
+  {
+    "Example": "BufferedPlayback",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1310920,
+    "StaticRamBytes": 103872,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\BufferedPlayback.log"
+  },
+  {
+    "Example": "VoicePTT",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1311920,
+    "StaticRamBytes": 95744,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\VoicePTT.log"
+  },
+  {
+    "Example": "BasicWiFi",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1310028,
+    "StaticRamBytes": 95656,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\final-wifi\\BasicWiFi.log"
+  },
+  {
+    "Example": "WiFiProvisioning",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1309504,
+    "StaticRamBytes": 95824,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\final-wifi\\WiFiProvisioning.log"
+  },
+  {
+    "Example": "CloudActivation",
+    "Fqbn": "esp32:esp32:esp32s3:PartitionScheme=min_spiffs",
+    "ExitCode": 0,
+    "FlashBytes": 1310016,
+    "StaticRamBytes": 95632,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\final-wifi\\CloudActivation.log"
+  },
+  {
+    "Example": "CachedSensor",
+    "Fqbn": "esp32:esp32:esp32h2",
+    "ExitCode": 0,
+    "FlashBytes": 738177,
+    "StaticRamBytes": 63572,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\cross\\h2.log"
+  },
+  {
+    "Example": "CustomTransport",
+    "Fqbn": "STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F401RE",
+    "ExitCode": 0,
+    "FlashBytes": 37940,
+    "StaticRamBytes": 41824,
+    "Warnings": 0,
+    "Log": "D:\\Git\\DeotalandDev\\.build\\fix-0.6.1\\cross\\stm32.log"
+  }
+]

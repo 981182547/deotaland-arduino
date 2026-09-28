@@ -33,6 +33,27 @@ struct Frame {
     std::vector<uint8_t> payload;     //Frame payload
 };
 
+// Borrowed payload; valid only while the input buffer is alive. Hot-path parsing
+// needs no allocation or copy. The owning Frame API remains available to tools.
+struct ByteView {
+    const uint8_t* bytes = nullptr;
+    size_t length = 0;
+    const uint8_t* data() const { return bytes; }
+    size_t size() const { return length; }
+    bool empty() const { return length == 0; }
+    uint8_t operator[](size_t i) const { return bytes[i]; }
+};
+struct FrameView {
+    uint8_t msg_type, command_id, sequence;
+    bool encrypted;
+    ByteView payload;
+};
+bool ParseFrameView(const uint8_t* data, size_t len, FrameView& out);
+// Return encoded byte count, or zero on invalid input / insufficient capacity.
+size_t EncodeEvent(uint8_t* out, size_t capacity, uint8_t id, const uint8_t* payload, size_t len);
+size_t EncodeResponse(uint8_t* out, size_t capacity, uint8_t id, uint8_t sequence,
+                      uint8_t status, uint16_t error, const uint8_t* extra, size_t len);
+
 /**
  * @brief Parse a raw byte stream into a Frame.
  * @param data Pointer to the input buffer.

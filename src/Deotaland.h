@@ -1,18 +1,16 @@
 #pragma once
 
-#if !defined(ARDUINO_ARCH_ESP32)
-#error "deotaland-arduino supports only the Arduino ESP32 core"
-#endif
-
-#include <Arduino.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "agent_link.h"
+#include "agent_link_ota.h"
 
 /**
  * Arduino-style facade over the stable C API in agent_link.h.
  *
- * The transport is asynchronous; no call from loop() is required. Callbacks can
- * run in the NimBLE host task, so they must enqueue work and return quickly.
+ * Call poll() from every loop iteration. Hardware callbacks run on that same
+ * thread. Transports enqueue data and never wait for network delivery.
  */
 class DeotalandClass {
 public:
@@ -20,8 +18,7 @@ public:
     esp_err_t begin(const agent_link_config_t& config);
 
     /**
-     * Convenience BLE startup. Strings and callback storage must remain valid
-     * for the lifetime of the connection.
+     * Convenience BLE startup. Configuration strings and callbacks are copied.
      */
     esp_err_t begin(const char* device_name, uint32_t capabilities,
                     const agent_output_cb_t* output = nullptr,
@@ -29,32 +26,61 @@ public:
                     void* state_context = nullptr);
 
     void end();
+    bool canBegin() const;
+    /** Up to max_events RX slices; default cooperative budget is 2000 us. */
+    size_t poll(size_t max_events = 4);
+    /** Override time budget; 0 disables it. Callbacks cannot be preempted. */
+    size_t poll(size_t max_events, uint32_t max_us);
+    void reset();
+    agent_link_stats_t stats() const;
+    esp_err_t pushPrompt(const char* utf8);
+    void setPlaybackBufferMs(uint32_t milliseconds);
+    esp_err_t configurePlayback(const agent_playback_config_t* config);
+    agent_playback_stats_t playbackStats() const;
+    esp_err_t prepareStreams(uint32_t stream_mask);
+    esp_err_t prepareOta();
+    esp_err_t streamStatus(agent_stream_t kind, agent_stream_status_t* out) const;
+    esp_err_t openStream(agent_stream_t kind, const agent_stream_opts_t* opts, agent_stream_handle_t* out);
+    esp_err_t writeStream(agent_stream_handle_t stream, const void* data, size_t bytes);
+    esp_err_t closeStream(agent_stream_handle_t stream, bool complete = true);
+    esp_err_t sendStream(agent_stream_t kind, const agent_stream_opts_t* opts, const void* data, size_t bytes);
+    bool isStreamOpen(agent_stream_t kind) const;
     agent_state_t state() const;
     bool isReady() const;
+    /** Readable diagnostics without Serial, Arduino String or heap allocation. */
+    static const char* stateName(agent_state_t state);
+    static const char* errorName(esp_err_t error);
+    static const char* errorHint(esp_err_t error);
+    /** Send congestion only. Retry later in loop, never in a busy while loop.
+     * NO_MEM during begin/prepare may instead require reducing RAM usage. */
+    static bool isRetryable(esp_err_t error);
+    /** Current single-prompt UTF-8 byte capacity; 0 until READY. */
+    size_t maxPromptBytes() const;
+    agent_link_status_t status() const;
+    const char* deviceId() const;
+    esp_err_t forget();
 
     esp_err_t registerIo(const agent_link_io_desc_t& desc,
                          agent_io_actuate_cb_t callback = nullptr,
                          void* context = nullptr);
     esp_err_t pushReading(const char* id, const void* value, size_t length);
-    esp_err_t pushVoice(const int16_t* samples, size_t sample_count);
-    esp_err_t pushVoiceBytes(const uint8_t* pcm16, size_t length);
-    esp_err_t endVoice();
-    esp_err_t startAsr(const char* name = nullptr);
-    esp_err_t pushAsr(const uint8_t* audio, size_t length);
-    esp_err_t endAsr(bool complete = true);
-    esp_err_t startRecording(const char* name, const uint8_t* wav_header, size_t header_length);
-    esp_err_t pushRecording(const uint8_t* data, size_t length);
-    esp_err_t endRecording(bool complete, const uint8_t* final_header = nullptr,
-                           size_t header_length = 0);
+    esp_err_t updateReading(const char* id, const void* value, size_t length);
+    /** Beginner-friendly cached readings: no pointers/sizeof required. Each
+     * checks the endpoint type, encodes little-endian, and copies before return.
+     * Register first; offline updates are allowed. ESP_OK means cached, not
+     * delivered. poll() publishes the latest sample when the link permits it. */
+    esp_err_t updateBool(const char* id, bool value);
+    esp_err_t updateInt32(const char* id, int32_t value);
+    esp_err_t updateUInt16(const char* id, uint16_t value);
+    esp_err_t updateFloat(const char* id, float value);
+    /** Text must fit AGENT_LINK_READING_CACHE_BYTES, excluding NUL. Empty text
+     * clears the cached STR value. nullptr is rejected; input is copied. */
+    esp_err_t updateText(const char* id, const char* utf8);
     esp_err_t pushEvent(agent_event_t type, const uint8_t* data = nullptr, size_t length = 0);
     esp_err_t reportBattery(uint8_t percent, bool charging);
     esp_err_t selectAgent(const char* agent_id);
     esp_err_t notifyManifestChanged();
-    esp_err_t pushVideo(const uint8_t* frame, size_t length, uint32_t pts_ms, bool keyframe);
-    esp_err_t endVideo();
 
-private:
-    bool started_ = false;
 };
 
 extern DeotalandClass Deotaland;

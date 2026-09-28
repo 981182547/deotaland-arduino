@@ -9,7 +9,7 @@
 #pragma once
 
 #include <stdbool.h>
-#include "esp_err.h"
+#include "agent_link_platform.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,8 +19,9 @@ extern "C" {
 typedef enum {
     AL_PROV_IDLE = 0,     ///< Waiting for the user to submit credentials.
     AL_PROV_CONNECTING,   ///< Credentials received; the station is attempting to join.
-    AL_PROV_CONNECTED,    ///< Station obtained an IP — provisioning succeeded.
+    AL_PROV_CONNECTED,    ///< Station obtained an IP and credentials were saved.
     AL_PROV_FAILED,       ///< Station failed to join with the submitted credentials.
+    AL_PROV_SAVE_FAILED,  ///< Station joined, but saving failed; portal stays open for retries.
 } al_prov_status_t;
 
 /**
@@ -58,5 +59,4 @@ bool al_wifi_prov_active(void);
 #ifdef __cplusplus
 }
 #endif
-
 

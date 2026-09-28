@@ -1,40 +1,32 @@
-/**
- * @file agent_link_transport.h
- * @brief Transport layer abstraction for agent_link.
- * @details Defines the interface for transport backends (BLE, WiFi) and the
- *          stream types used for data-plane communication.
- *          Control-plane frames (commands/responses/events) are sent via
- *          send_ctrl(). Data-plane streams (voice, video, recording, file)
- *          are sent via stream_start/send_stream/stream_end.
- */
-
-
 #pragma once
-
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include "esp_err.h"
-
+#include "agent_link_platform.h"
+#include "agent_link_stream.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
+struct agent_link_status_s;
+struct agent_platform_s;
 
-/**
- * @brief Data‑plane stream type
- * @note The transport backend selects the media channel: BLE voice uplink uses
- *       GATT Notify, BLE recording uses L2CAP CoC, and future WiFi media uses WebRTC.
- */
-typedef enum {
-    AGENT_STREAM_VOICE = 0,    ///< Voice (microphone uplink / TTS downlink)
-    AGENT_STREAM_VIDEO,        ///< Video (camera uplink / remote downlink) — WiFi only
-    AGENT_STREAM_RECORDING,    ///< Recording file upload
-    AGENT_STREAM_FILE,         ///< File transfer / OTA
-} agent_stream_t;
+// RX data is copied before returning. Full queue -> ESP_ERR_NO_MEM; retry later.
+// Non-ESP32 adapters call these from poll(), not from interrupts or other threads.
+// Serialize connection/data callbacks: report disconnect before a replacement peer
+// can submit data. Discard old outbound work on disconnect; queued sends belong to
+// the peer that accepted them and must never be replayed to a later connection.
+typedef struct {
+    esp_err_t (*on_ctrl)(const uint8_t* data, size_t len);
+    esp_err_t (*on_stream)(agent_stream_t type, const uint8_t* data, size_t len);
+    void (*on_connection)(bool connected);
+    void (*on_ready)(void);
+    void (*on_status)(const struct agent_link_status_s* status);
+} agent_transport_callbacks_t;
 
 /**
  * @brief Transport backend operation table
- * @note All functions must be implemented by the backend
+ * @note start/stop/send_ctrl/is_ready/bind are required for custom backends.
+ *       Stream functions are optional as a complete set; NULL means unsupported.
  *       Control plane is reliable but low‑bandwidth (GATT, WS, MQTT)
  *       Data plane is high‑throughput (L2CAP, WebRTC)
  */
@@ -65,7 +57,7 @@ typedef struct agent_transport_s {
     /**
      * @brief Start a data‑plane stream session
      * @param impl     Backend private context
-     * @param type     Stream type (voice/video/recording/file)
+     * @param type     Stream type (voice/audio/image/video/file)
      * @param meta     Optional metadata (e.g., codec, sample rate)
      * @param meta_len Length of meta
      * @return ESP_OK on success, error code otherwise
@@ -81,7 +73,7 @@ typedef struct agent_transport_s {
      * @param len  Data length
      * @return ESP_OK on success, error code otherwise
      * @note For BLE voice, this uses GATT Notify 0xFFA1 (event 0x40 VoiceChunk)
-     *       Recording/files use L2CAP CoC; video is WiFi only
+     *       AUDIO and IMAGE use separate L2CAP CoC channels on BLE.
      */
     esp_err_t (*send_stream)(void* impl, agent_stream_t type, const uint8_t* data, size_t len);
 
@@ -103,6 +95,17 @@ typedef struct agent_transport_s {
     bool      (*is_ready)(void* impl);
 
     void*     impl;  // Backend private context
+
+    // Optional bounded service step, called once per agent_link_poll(). No waits.
+    void (*poll)(void* impl);
+    // Required for custom backends. Copy callbacks; NULL unbinds on deinit.
+    void (*bind)(void* impl, const agent_transport_callbacks_t* callbacks);
+    // Maximum complete control frame, including its 6-byte header. Default 20.
+    size_t (*ctrl_mtu)(void* impl);
+    // Optional setup-time resource preparation; never called automatically by poll.
+    esp_err_t (*prepare_streams)(void* impl, uint32_t stream_mask);
+    // Optional local transport progress, including drain after stream_end returns.
+    esp_err_t (*stream_status)(void* impl, agent_stream_t kind, agent_stream_status_t* out);
 } agent_transport_t;
 
 /**
@@ -110,9 +113,15 @@ typedef struct agent_transport_s {
  * @return Pointer to the BLE transport operation table
  * @note Control plane is fully implemented.
  *       Data plane (send_stream) is ready for voice via GATT Notify,
- *       recording via L2CAP CoC when enabled by the Core; generic files are pending
+ *       AUDIO/IMAGE via L2CAP CoC when enabled by the Core; FILE/VIDEO are unsupported
  */
 agent_transport_t* agent_transport_ble(void);
+bool agent_transport_ble_get_mac(uint8_t out[6]);
+esp_err_t agent_transport_ble_forget(void);
+bool agent_transport_ble_active(void);
+bool agent_transport_ble_l2cap_ready(void);
+void agent_transport_ble_set_data_receiver(size_t (*receive)(const uint8_t*, size_t),
+                                           bool (*ready)(void));
 
 /**
  * @brief Set BLE advertising name
@@ -188,6 +197,10 @@ struct agent_wifi_config_s;
  * @note Called by agent_link_init() to pass the wifi config.
  */
 void agent_transport_wifi_set_config(const struct agent_wifi_config_s* cfg);
+void agent_transport_wifi_set_platform(const struct agent_platform_s* platform, const char* firmware);
+void agent_transport_wifi_set_status(void (*cb)(const struct agent_link_status_s*));
+esp_err_t agent_transport_wifi_forget(void);
+bool agent_transport_wifi_active(void);
 
 /** Set the device name used as the SoftAP SSID prefix for WiFi provisioning. */
 void agent_transport_wifi_set_name(const char* name);

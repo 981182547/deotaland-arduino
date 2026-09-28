@@ -1,15 +1,14 @@
 #include "Deotaland.h"
+#include <cstring>
 
 DeotalandClass Deotaland;
 
 esp_err_t DeotalandClass::begin(const agent_link_config_t& config) {
-    if (started_) return ESP_ERR_INVALID_STATE;
-
     esp_err_t result = agent_link_init(&config);
     if (result != ESP_OK) return result;
 
     result = agent_link_start();
-    if (result == ESP_OK) started_ = true;
+    if (result != ESP_OK) agent_link_stop();
     return result;
 }
 
@@ -28,14 +27,78 @@ esp_err_t DeotalandClass::begin(const char* device_name, uint32_t capabilities,
 }
 
 void DeotalandClass::end() {
-    if (!started_) return;
     agent_link_stop();
-    started_ = false;
 }
+bool DeotalandClass::canBegin() const { return agent_link_can_begin(); }
+esp_err_t DeotalandClass::configurePlayback(const agent_playback_config_t* c) { return agent_link_playback_configure(c); }
+agent_playback_stats_t DeotalandClass::playbackStats() const { agent_playback_stats_t s={}; agent_link_playback_get_stats(&s); return s; }
+esp_err_t DeotalandClass::prepareStreams(uint32_t mask) { return agent_link_prepare_streams(mask); }
+esp_err_t DeotalandClass::prepareOta() { return agent_link_ota_prepare(); }
+esp_err_t DeotalandClass::streamStatus(agent_stream_t kind,agent_stream_status_t* out) const { return agent_link_stream_get_status(kind,out); }
+esp_err_t DeotalandClass::updateReading(const char* id,const void* value,size_t n) { return agent_link_update_reading(id,value,n); }
 
 agent_state_t DeotalandClass::state() const { return agent_link_state(); }
 
 bool DeotalandClass::isReady() const { return state() == AGENT_STATE_READY; }
+const char* DeotalandClass::stateName(agent_state_t state) {
+    switch (state) {
+    case AGENT_STATE_DISCONNECTED: return "DISCONNECTED";
+    case AGENT_STATE_CONNECTED: return "CONNECTED";
+    case AGENT_STATE_READY: return "READY";
+    default: return "UNKNOWN";
+    }
+}
+const char* DeotalandClass::errorName(esp_err_t error) { return esp_err_to_name(error); }
+bool DeotalandClass::isRetryable(esp_err_t error) {
+    return error == ESP_ERR_NO_MEM || error == ESP_ERR_TIMEOUT;
+}
+const char* DeotalandClass::errorHint(esp_err_t error) {
+    switch (error) {
+    case ESP_OK: return "Accepted locally; this is not a peer delivery acknowledgement.";
+    case ESP_ERR_NO_MEM: return "Send queue full: retry later; during setup, check RAM and endpoint count.";
+    case ESP_ERR_TIMEOUT: return "Retry this operation later from loop(); keep the same stream bytes.";
+    case ESP_ERR_INVALID_ARG: return "Check required fields, endpoint type and value (finite numbers; BOOL 0/1).";
+    case ESP_ERR_INVALID_STATE: return "Check begin(), READY, duplicate IDs, stream subscription and canBegin().";
+    case ESP_ERR_INVALID_SIZE: return "Check UTF-8 byte length, value width, cache limit and current MTU.";
+    case ESP_ERR_NOT_FOUND: return "Register this exact input endpoint ID before updating a reading.";
+    case ESP_ERR_NOT_SUPPORTED: return "Check chip/Core support: BLE, CoC, transport and enabled features.";
+    default: return "Inspect the operation's error code and status(); check the troubleshooting guide.";
+    }
+}
+size_t DeotalandClass::maxPromptBytes() const { return agent_link_event_payload_capacity(); }
+
+namespace {
+esp_err_t UpdateScalar(const char* id, agent_val_t type, uint32_t bits, size_t bytes) {
+    const uint8_t encoded[4] = {static_cast<uint8_t>(bits), static_cast<uint8_t>(bits >> 8),
+        static_cast<uint8_t>(bits >> 16), static_cast<uint8_t>(bits >> 24)};
+    return agent_link_update_reading_typed(id, type, encoded, bytes);
+}
+}
+esp_err_t DeotalandClass::updateBool(const char* id, bool value) {
+    return UpdateScalar(id, AGENT_VAL_BOOL, value ? 1u : 0u, 1);
+}
+esp_err_t DeotalandClass::updateInt32(const char* id, int32_t value) {
+    return UpdateScalar(id, AGENT_VAL_I32, static_cast<uint32_t>(value), 4);
+}
+esp_err_t DeotalandClass::updateUInt16(const char* id, uint16_t value) {
+    return UpdateScalar(id, AGENT_VAL_U16, value, 2);
+}
+esp_err_t DeotalandClass::updateFloat(const char* id, float value) {
+    static_assert(sizeof(float) == 4, "Agent Link requires 32-bit float");
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return UpdateScalar(id, AGENT_VAL_F32, bits, 4);
+}
+esp_err_t DeotalandClass::updateText(const char* id, const char* utf8) {
+    if (!utf8) return ESP_ERR_INVALID_ARG;
+    size_t length = 0;
+    while (length <= AGENT_LINK_READING_CACHE_BYTES && utf8[length]) ++length;
+    if (length > AGENT_LINK_READING_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
+    return agent_link_update_reading_typed(id, AGENT_VAL_STR, utf8, length);
+}
+agent_link_status_t DeotalandClass::status() const { agent_link_status_t s = {}; agent_link_get_status(&s); return s; }
+const char* DeotalandClass::deviceId() const { return agent_link_device_id(); }
+esp_err_t DeotalandClass::forget() { return agent_link_forget(); }
 
 esp_err_t DeotalandClass::registerIo(const agent_link_io_desc_t& desc,
                                      agent_io_actuate_cb_t callback,
@@ -45,40 +108,6 @@ esp_err_t DeotalandClass::registerIo(const agent_link_io_desc_t& desc,
 
 esp_err_t DeotalandClass::pushReading(const char* id, const void* value, size_t length) {
     return agent_link_push_reading(id, value, length);
-}
-
-esp_err_t DeotalandClass::pushVoice(const int16_t* samples, size_t sample_count) {
-    if (!samples || sample_count == 0) return ESP_ERR_INVALID_ARG;
-    return agent_link_push_voice(reinterpret_cast<const uint8_t*>(samples),
-                                 sample_count * sizeof(int16_t));
-}
-
-esp_err_t DeotalandClass::pushVoiceBytes(const uint8_t* pcm16, size_t length) {
-    return agent_link_push_voice(pcm16, length);
-}
-
-esp_err_t DeotalandClass::endVoice() { return agent_link_voice_end(); }
-
-esp_err_t DeotalandClass::startAsr(const char* name) { return agent_link_asr_start(name); }
-
-esp_err_t DeotalandClass::pushAsr(const uint8_t* audio, size_t length) {
-    return agent_link_asr_push(audio, length);
-}
-
-esp_err_t DeotalandClass::endAsr(bool complete) { return agent_link_asr_end(complete); }
-
-esp_err_t DeotalandClass::startRecording(const char* name, const uint8_t* wav_header,
-                                         size_t header_length) {
-    return agent_link_recording_start(name, wav_header, header_length);
-}
-
-esp_err_t DeotalandClass::pushRecording(const uint8_t* data, size_t length) {
-    return agent_link_recording_data(data, length);
-}
-
-esp_err_t DeotalandClass::endRecording(bool complete, const uint8_t* final_header,
-                                       size_t header_length) {
-    return agent_link_recording_end(complete, final_header, header_length);
 }
 
 esp_err_t DeotalandClass::pushEvent(agent_event_t type, const uint8_t* data, size_t length) {
@@ -97,9 +126,14 @@ esp_err_t DeotalandClass::notifyManifestChanged() {
     return agent_link_notify_manifest_changed();
 }
 
-esp_err_t DeotalandClass::pushVideo(const uint8_t* frame, size_t length,
-                                    uint32_t pts_ms, bool keyframe) {
-    return agent_link_push_video(frame, length, pts_ms, keyframe);
-}
-
-esp_err_t DeotalandClass::endVideo() { return agent_link_video_end(); }
+size_t DeotalandClass::poll(size_t n) { return agent_link_poll(n); }
+size_t DeotalandClass::poll(size_t n, uint32_t us) { return agent_link_poll_budget(n,us); }
+void DeotalandClass::reset() { agent_link_deinit(); }
+agent_link_stats_t DeotalandClass::stats() const { agent_link_stats_t s = {}; agent_link_get_stats(&s); return s; }
+esp_err_t DeotalandClass::pushPrompt(const char* s) { return agent_link_push_prompt(s); }
+void DeotalandClass::setPlaybackBufferMs(uint32_t ms) { agent_link_playback_set_buffer_ms(ms); }
+esp_err_t DeotalandClass::openStream(agent_stream_t k, const agent_stream_opts_t* o, agent_stream_handle_t* h) { return agent_link_stream_open(k,o,h); }
+esp_err_t DeotalandClass::writeStream(agent_stream_handle_t h,const void* p,size_t n) { return agent_link_stream_write(h,p,n); }
+esp_err_t DeotalandClass::closeStream(agent_stream_handle_t h,bool ok) { return agent_link_stream_close(h,ok); }
+esp_err_t DeotalandClass::sendStream(agent_stream_t k,const agent_stream_opts_t* o,const void* p,size_t n) { return agent_link_stream_send(k,o,p,n); }
+bool DeotalandClass::isStreamOpen(agent_stream_t kind) const { return agent_link_stream_is_open(kind); }
