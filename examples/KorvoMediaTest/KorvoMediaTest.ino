@@ -213,6 +213,8 @@ i2s_chan_handle_t txChan = nullptr;
 i2s_chan_handle_t rxChan = nullptr;
 
 // 全双工：TX 接 ES8311，RX 接 ES7210，共用 MCLK/BCLK/WS。先让时钟跑起来，再配置编解码器。
+// 收发都用立体声帧（左右各 16 bit），单声道转换在软件里做：实测 S3 的单声道 RX 仍会收进两个声道，
+// 数据量翻倍。
 esp_err_t initI2s() {
   i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan.auto_clear = true;  // 播放缓冲为空时输出静音，不重复旧数据
@@ -220,7 +222,7 @@ esp_err_t initI2s() {
   if (result != ESP_OK) return result;
   i2s_std_config_t cfg = {};
   cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate);  // MCLK = 256 x 16 kHz
-  cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+  cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
   cfg.gpio_cfg.mclk = kI2sMclk;
   cfg.gpio_cfg.bclk = kI2sBclk;
   cfg.gpio_cfg.ws = kI2sWs;
@@ -318,6 +320,7 @@ StreamBufferHandle_t makeBuffer(size_t bytes, size_t fallbackBytes, StaticStream
 
 void speakerTask(void*) {
   int16_t pcm[256];
+  int16_t stereo[512];
   bool empty = true;
   for (;;) {
     if (flushSpeaker.load(std::memory_order_acquire)) {
@@ -332,20 +335,26 @@ void speakerTask(void*) {
       continue;
     }
     empty = false;
+    const size_t samples = got / sizeof(int16_t);
+    for (size_t i = 0; i < samples; ++i) stereo[2 * i] = stereo[2 * i + 1] = pcm[i];  // 左右声道相同
     size_t written = 0;
-    i2s_channel_write(txChan, pcm, got & ~size_t(1), &written, portMAX_DELAY);
+    i2s_channel_write(txChan, stereo, samples * 2 * sizeof(int16_t), &written, portMAX_DELAY);
   }
 }
 
 void micTask(void*) {
+  int16_t stereo[kFrameSamples * 2];
   int16_t pcm[kFrameSamples];
   for (;;) {
     size_t got = 0;
-    if (i2s_channel_read(rxChan, pcm, sizeof(pcm), &got, portMAX_DELAY) != ESP_OK || got != sizeof(pcm)) continue;
+    if (i2s_channel_read(rxChan, stereo, sizeof(stereo), &got, portMAX_DELAY) != ESP_OK || got != sizeof(stereo))
+      continue;
     if (!micCapture.load(std::memory_order_acquire)) continue;
+    // ES7210 标准 I2S：左声道 MIC1，右声道 MIC2。只取 MIC1，得到 16 kHz 单声道。
+    for (size_t i = 0; i < kFrameSamples; ++i) pcm[i] = stereo[2 * i];
     // 整帧写入或整帧丢弃，保证 loop 读到的永远是对齐的 20 ms 帧。
-    if (xStreamBufferSpacesAvailable(micBuf) >= got) xStreamBufferSend(micBuf, pcm, got, 0);
-    else micOverflowBytes.fetch_add(static_cast<uint32_t>(got));
+    if (xStreamBufferSpacesAvailable(micBuf) >= sizeof(pcm)) xStreamBufferSend(micBuf, pcm, sizeof(pcm), 0);
+    else micOverflowBytes.fetch_add(static_cast<uint32_t>(sizeof(pcm)));
   }
 }
 
@@ -532,9 +541,10 @@ void printMicLevel() {
 
 void printUplinkReport(const agent_stream_status_t& status, esp_err_t statusError, uint32_t now) {
   const uint32_t captureMs = up.stoppedAt - up.startedAt;
-  Serial.printf("[%s 上行] 采集 %u ms：发送 %u 帧（%u B），拥塞丢弃 %u 帧\n", kindName(up.kind),
+  Serial.printf("[%s 上行] 采集 %u ms：发送 %u 帧（%u B），拥塞丢弃 %u 帧；按 16 kHz 应约 %u 帧\n", kindName(up.kind),
                 static_cast<unsigned>(captureMs), static_cast<unsigned>(up.framesSent),
-                static_cast<unsigned>(up.framesSent * kFrameBytes), static_cast<unsigned>(up.framesDropped));
+                static_cast<unsigned>(up.framesSent * kFrameBytes), static_cast<unsigned>(up.framesDropped),
+                static_cast<unsigned>(captureMs / 20));
   printMicLevel();
   if (statusError != ESP_OK) {
     Serial.printf("           无法读取通道状态: %s\n", Deotaland.errorName(statusError));
@@ -546,6 +556,8 @@ void printUplinkReport(const agent_stream_status_t& status, esp_err_t statusErro
                 streamStateName(status.state), Deotaland.errorName(status.last_error),
                 static_cast<unsigned>(now - up.stoppedAt), kbps(status.sent_bytes, totalMs));
   if (up.framesDropped) Serial.println("           有丢帧：上行速度跟不上实时采集（32 KB/s）。");
+  if (!up.complete && status.last_error == ESP_ERR_INVALID_STATE)
+    Serial.println("           因丢帧按不完整关闭（complete=false），库把状态记为 FAILED；已接收的数据仍全部发出。");
 }
 
 void printImageReport(const agent_stream_status_t& status, esp_err_t statusError, uint32_t now, bool timedOut) {
@@ -726,7 +738,9 @@ void serviceUplink(uint32_t now) {
       micCapture.store(false, std::memory_order_release);
       up.stoppedAt = now;
       if (up.localOnly) {
-        Serial.printf("[麦克风自检] 采集 %u 帧\n", static_cast<unsigned>(up.framesSent));
+        Serial.printf("[麦克风自检] %u ms 采集 %u 帧，按 16 kHz 应约 %u 帧\n",
+                      static_cast<unsigned>(up.stoppedAt - up.startedAt), static_cast<unsigned>(up.framesSent),
+                      static_cast<unsigned>((up.stoppedAt - up.startedAt) / 20));
         printMicLevel();
         up.phase = UpPhase::Idle;
         return;
@@ -1065,7 +1079,7 @@ void setup() {
     audioReady = es8311Ok && es7210Ok;
     if (audioReady) {
       xTaskCreatePinnedToCore(speakerTask, "korvo_spk", 4096, nullptr, 5, nullptr, 1);
-      xTaskCreatePinnedToCore(micTask, "korvo_mic", 4096, nullptr, 5, nullptr, 1);
+      xTaskCreatePinnedToCore(micTask, "korvo_mic", 6144, nullptr, 5, nullptr, 1);
     }
   }
 
