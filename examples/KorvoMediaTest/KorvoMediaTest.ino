@@ -51,6 +51,8 @@ constexpr size_t kFrameSamples = 320;  // 20 ms
 constexpr size_t kFrameBytes = kFrameSamples * sizeof(int16_t);
 constexpr size_t kPlayBufBytes = 64 * 1024;  // TTS 缓冲 2 s，放 PSRAM
 constexpr size_t kMicBufBytes = 16 * 1024;   // 麦克风缓冲 512 ms，吸收拍照编码时的 loop 停顿
+constexpr size_t kPlayBufFallbackBytes = 8 * 1024;  // 没有 PSRAM 时只占少量内部 RAM，留给 BLE
+constexpr size_t kMicBufFallbackBytes = 4 * 1024;
 constexpr uint8_t kDacVolume = 0xB3;         // ES8311 数字音量：0xBF = 0 dB，每步 0.5 dB
 constexpr uint8_t kMicGain = 10;             // ES7210 PGA 档位：10 = 30 dB
 constexpr uint32_t kVoiceMaxMs = 10000;
@@ -299,10 +301,18 @@ std::atomic<bool> micCapture{false};
 std::atomic<uint32_t> speakerUnderruns{0};
 std::atomic<uint32_t> micOverflowBytes{0};
 
-StreamBufferHandle_t makeBuffer(size_t bytes, StaticStreamBuffer_t* state) {
-  // 静态缓冲的存储区比容量多 1 字节；优先放 PSRAM，把内部 RAM 留给 BLE。
+size_t playBufBytes = 0;  // 实际容量：有 PSRAM 时为 kPlayBufBytes，否则为退回的小缓冲
+size_t micBufBytes = 0;
+
+StreamBufferHandle_t makeBuffer(size_t bytes, size_t fallbackBytes, StaticStreamBuffer_t* state, size_t* capacity) {
+  // 静态缓冲的存储区比容量多 1 字节。优先放 PSRAM；没有 PSRAM 时退回小容量内部 RAM，
+  // 不能按原容量占内部 RAM，否则 BLE 会没有内存可用。
   auto* storage = static_cast<uint8_t*>(heap_caps_malloc(bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!storage) storage = static_cast<uint8_t*>(heap_caps_malloc(bytes + 1, MALLOC_CAP_8BIT));
+  if (!storage) {
+    bytes = fallbackBytes;
+    storage = static_cast<uint8_t*>(heap_caps_malloc(bytes + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  *capacity = storage ? bytes : 0;
   return storage ? xStreamBufferCreateStatic(bytes, 1, storage, state) : nullptr;
 }
 
@@ -979,23 +989,77 @@ void handleSerial() {
   }
 }
 
+// ============================================================================
+// 串口调试信息：启动步骤、链路状态变化、10 秒心跳
+// ============================================================================
+
+agent_state_t lastState = AGENT_STATE_DISCONNECTED;
+uint32_t lastHeartbeat = 0;
+
+// 每步结果立即打印并等串口发完，卡死或重启时能看出停在哪一步。
+void bootLog(const char* step, const char* result) {
+  Serial.printf("[启动] %s：%s\n", step, result);
+  Serial.flush();
+}
+
+void reportLinkState() {
+  const agent_state_t state = Deotaland.state();
+  if (state == lastState) return;
+  Serial.printf("[链路] %s -> %s\n", Deotaland.stateName(lastState), Deotaland.stateName(state));
+  if (state == AGENT_STATE_CONNECTED)
+    Serial.println("       已连接，等待 App 订阅事件特征 0xFFC4");
+  else if (state == AGENT_STATE_READY)
+    Serial.printf("       READY，ATT MTU=%u，可以输入 v / a / c 开始测试\n",
+                  static_cast<unsigned>(agent_transport_ble_att_mtu()));
+  else
+    Serial.println("       已断开，等待 App 重新连接 Deotaland-Korvo");
+  lastState = state;
+}
+
+void heartbeat(uint32_t now) {
+  if (now - lastHeartbeat < 10000) return;
+  lastHeartbeat = now;
+  if (!started) {
+    Serial.printf("[心跳] %u s 蓝牙未启动：%s；输入 ? 看详细状态\n", static_cast<unsigned>(now / 1000),
+                  Deotaland.errorName(startError));
+    return;
+  }
+  Serial.printf("[心跳] %u s 链路=%s MTU=%u 内部RAM=%u PSRAM=%u；输入 ? 看详细状态\n",
+                static_cast<unsigned>(now / 1000), Deotaland.stateName(Deotaland.state()),
+                static_cast<unsigned>(agent_transport_ble_att_mtu()),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+}
+
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
+  // 用原生 USB 口（USB CDC On Boot = Enabled）时等主机打开串口，最多 2 秒；UART 口不会等待。
+  for (const uint32_t start = millis(); !Serial && millis() - start < 2000;) delay(10);
   delay(300);
+  Serial.println();
   Serial.println("KorvoMediaTest：BLE 语音上行 / TTS 下行 / 图片上行联调");
+  const size_t psramBytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  Serial.printf("[启动] PSRAM：%u B\n", static_cast<unsigned>(psramBytes));
+  if (!psramBytes)
+    Serial.println("[启动] 警告：PSRAM 为 0，Arduino IDE 工具菜单的 PSRAM 需选 OPI PSRAM；否则摄像头无法使用。");
 
   // 1. I2C（Wire = I2C0），摄像头和两颗编解码器都挂在这条总线上。
-  Wire.begin(kI2cSda, kI2cScl, 100000);
+  bootLog("I2C SDA=17 SCL=18", Wire.begin(kI2cSda, kI2cScl, 100000) ? "OK" : "失败");
 
   // 2. 音频：I2S 时钟先跑起来，再配置编解码器，最后打开功放。
-  playBuf = makeBuffer(kPlayBufBytes, &playBufState);
-  micBuf = makeBuffer(kMicBufBytes, &micBufState);
+  playBuf = makeBuffer(kPlayBufBytes, kPlayBufFallbackBytes, &playBufState, &playBufBytes);
+  micBuf = makeBuffer(kMicBufBytes, kMicBufFallbackBytes, &micBufState, &micBufBytes);
+  Serial.printf("[启动] 音频缓冲：播放 %u B，麦克风 %u B\n", static_cast<unsigned>(playBufBytes),
+                static_cast<unsigned>(micBufBytes));
   i2sError = (playBuf && micBuf) ? initI2s() : ESP_ERR_NO_MEM;
+  bootLog("I2S 全双工 16 kHz", Deotaland.errorName(i2sError));
   if (i2sError == ESP_OK) {
     es8311Ok = initEs8311();
+    bootLog("ES8311 扬声器(0x18)", es8311Ok ? "OK" : "失败：I2C 未应答或寄存器写入出错");
     es7210Ok = initEs7210();
+    bootLog("ES7210 麦克风(0x40)", es7210Ok ? "OK" : "失败：I2C 未应答或寄存器写入出错");
     pinMode(kPaEnablePin, OUTPUT);
     digitalWrite(kPaEnablePin, es8311Ok ? HIGH : LOW);
     audioReady = es8311Ok && es7210Ok;
@@ -1006,8 +1070,13 @@ void setup() {
   }
 
   // 3. 摄像头。
+  bootLog("摄像头 GC2145", "初始化中…");
   cameraError = initCamera();
   cameraReady = cameraError == ESP_OK;
+  if (cameraReady)
+    Serial.printf("[启动] 摄像头：OK，PID=0x%04X\n", static_cast<unsigned>(cameraPid));
+  else
+    bootLog("摄像头", Deotaland.errorName(cameraError));
 
   // 4. 蓝牙。camera0 端点让 App 也能触发拍照；端点必须在 begin 前注册。
   cameraIo.id = "camera0";
@@ -1030,6 +1099,7 @@ void setup() {
   config.firmware_rev = "2.0.0";
   startError = Deotaland.begin(config);
   started = startError == ESP_OK;
+  bootLog("蓝牙 begin（广播名 Deotaland-Korvo）", Deotaland.errorName(startError));
   if (started) {
     agent_stream_status_t status = {};
     // 内置 BLE 的 AUDIO、IMAGE 与 TTS 共用 CoC 编译能力；只看返回码，连接前的状态不代表能力。
@@ -1046,7 +1116,7 @@ void setup() {
         result = Deotaland.configurePlayback(&playback);
         if (result != ESP_OK) Serial.printf("configurePlayback: %s\n", Deotaland.errorName(result));
         // 声明真实能缓冲的时长，库据此给 App 发暂停/恢复（事件 0x20）。
-        Deotaland.setPlaybackBufferMs(kPlayBufBytes / 32);
+        Deotaland.setPlaybackBufferMs(playBufBytes / 32);
       }
     }
   }
@@ -1056,6 +1126,8 @@ void setup() {
 void loop() {
   if (started) Deotaland.poll();
   const uint32_t now = millis();
+  reportLinkState();
+  heartbeat(now);
   handleLinkEvents();
   handleSerial();
   serviceUplink(now);
