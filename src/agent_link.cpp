@@ -39,6 +39,14 @@ unsigned s_end_cursor = 0;
 unsigned s_reading_cursor = 0;
 bool s_audio_end_pending = false;
 bool s_audio_finished = false;
+// A retry of the most recent successful VoiceReply must ACK without replaying
+// Arm/Finish. Those side effects clear staged PCM or call the board's END twice.
+// Only exact consecutive requests are deduplicated: another command invalidates
+// this slot, so sequence wrap and later session-ID reuse remain valid.
+bool s_voice_reply_seen = false;
+uint8_t s_voice_reply_sequence = 0;
+uint8_t s_voice_reply_payload[6] = {};
+size_t s_voice_reply_length = 0;
 uint32_t s_generation = 0;
 agent_link_stats_t s_stats = {};
 agent_stream_session s_streams[AGENT_STREAM_KIND_COUNT] = {
@@ -254,6 +262,10 @@ esp_err_t ValidateIoValue(agent_val_t type, const void* value, size_t len) {
     const int width = IoValueSize(type);
     if (width >= 0 && len != static_cast<size_t>(width)) return ESP_ERR_INVALID_SIZE;
     const auto* bytes = static_cast<const uint8_t*>(value);
+    // STR travels as UTF-8 and is exposed to C-string display callbacks. Reject
+    // embedded NUL and malformed scalar encodings instead of silently truncating
+    // the actuator or forwarding unreadable sensor text. BLOB remains binary.
+    if (type == AGENT_VAL_STR && !agentlink::IsUtf8Text(bytes,len)) return ESP_ERR_INVALID_ARG;
     if (type == AGENT_VAL_BOOL && bytes[0] > 1) return ESP_ERR_INVALID_ARG;
     if (type == AGENT_VAL_F32 || type == AGENT_VAL_VEC2 || type == AGENT_VAL_VEC3) {
         for (size_t offset = 0; offset < len; offset += 4) {
@@ -522,6 +534,7 @@ void OnConn(bool connected) {
     // A fresh control session must not inherit a partial PCM/ADPCM block.
     agentlink::audio::OnLinkState(false);
     s_audio_end_pending=s_audio_finished=false;
+    s_voice_reply_seen=false;
     s_manifest_sent = false;      // reset on connect and disconnect: re-send after 0xFFC4 subscribe (BLE) / after connect (WiFi)
     if (!connected) {
 
@@ -541,6 +554,17 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
         return;
     }
     if (f.encrypted || f.msg_type != agentlink::kMsgCommand) return;  // the device side only handles "commands"
+
+    const bool voice_replay = f.command_id==0x05 && s_voice_reply_seen &&
+        f.sequence==s_voice_reply_sequence && f.payload.size()==s_voice_reply_length &&
+        memcmp(f.payload.data(),s_voice_reply_payload,s_voice_reply_length)==0;
+    s_voice_reply_seen=false;
+    if (voice_replay) {
+        s_voice_reply_seen=true;
+        s_response_size=agentlink::EncodeResponse(s_response,sizeof(s_response),0x05,
+            f.sequence,0,0,nullptr,0);
+        return;
+    }
 
     ESP_LOGD(TAG, "cmd 0x%02X seq=%u payload=%uB",
              f.command_id, f.sequence, static_cast<unsigned>(f.payload.size()));
@@ -716,6 +740,10 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
                 if (s_have_out && s_out.on_audio_end) s_out.on_audio_end(s_out.ctx);
             }
         }
+        s_voice_reply_seen=true;
+        s_voice_reply_sequence=f.sequence;
+        s_voice_reply_length=f.payload.size();
+        memcpy(s_voice_reply_payload,f.payload.data(),s_voice_reply_length);
     }
     if (extra_len > sizeof(extra) || extra_len + 10 > ControlMtu()) {
         extra_len=0; status=1; error=1004;
@@ -798,6 +826,7 @@ esp_err_t agent_link_init(const agent_link_config_t* cfg) {
     s_state=AGENT_STATE_DISCONNECTED;
     s_stats={};
     s_service_cursor=s_end_cursor=s_reading_cursor=0; s_audio_end_pending=s_audio_finished=false;
+    s_voice_reply_seen=false;
     s_bat_current_pct=s_bat_current_chg=-1;
     agentlink::audio::SetSinks(OnDecodedPcm,SendServiceEvent);
     s_playback={};
@@ -863,6 +892,7 @@ void agent_link_stop(void) {
     s_manifest.clear(); s_manifest_building=false; s_manifest_sent=false; s_response_size=0;
     agentlink::audio::OnLinkState(false);
     s_audio_end_pending=false;
+    s_voice_reply_seen=false;
     agentlink::ota::OnLinkState(false);
 }
 void agent_link_deinit(void) {
@@ -907,6 +937,7 @@ esp_err_t agent_link_playback_configure(const agent_playback_config_t* config) {
     return ESP_OK;
 }
 void agent_link_playback_get_stats(agent_playback_stats_t* out) { agentlink::audio::GetStats(out); }
+bool agent_link_playback_active(void) { return Ready() && (agentlink::audio::IsArmed() || s_audio_end_pending); }
 esp_err_t agent_link_forget(void) {
     if (!s_running || s_polling) return ESP_ERR_INVALID_STATE;
     if (s_cfg.transport == AGENT_TRANSPORT_BLE) return agent_transport_ble_forget();
@@ -986,6 +1017,7 @@ size_t agent_link_poll_budget(size_t budget, uint32_t max_us) {
         s_response_size=0; s_rx_pending=false;
         agentlink::audio::OnLinkState(false);
         s_audio_end_pending=s_audio_finished=false;
+        s_voice_reply_seen=false;
     }
     size_t done=0;
     bool response_blocked=false;
@@ -1063,8 +1095,11 @@ esp_err_t agent_link_report_battery(uint8_t percent, bool charging) {
     return ESP_OK;
 }
 esp_err_t agent_link_report_selected_agent(const char* agent_id) {
-    (void)agent_id;
-    return not_ready("report_selected_agent");  // TODO: 0x16 event (needs index + name_len + name format)
+    if (!agent_id || !agent_id[0]) return ESP_ERR_INVALID_ARG;
+    if (!Ready()) return not_ready("report_selected_agent");
+    // The upstream 0x16 selection event has no completed mapping from Agent ID
+    // to its index/name payload. Report support honestly once the link is ready.
+    return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t agent_link_push_event(agent_event_t type, const uint8_t* data, size_t len) {
     if (len > 0 && !data) return ESP_ERR_INVALID_ARG;
@@ -1192,6 +1227,9 @@ esp_err_t ValidateReading(const char* id,const void* value,size_t len,int& idx) 
 esp_err_t agent_link_push_reading(const char* id,const void* value,size_t len) {
     if(!id || !value) return ESP_ERR_INVALID_ARG;
     if(!Ready() || !s_tx->send_ctrl) return ESP_ERR_INVALID_STATE;
+    // Reject an impossible variable-length value before traversing UTF-8. The
+    // control budget is also the bound on validation work in this immediate API.
+    if(len>PayloadBudget()) return ESP_ERR_INVALID_SIZE;
     int idx=0; const esp_err_t valid=ValidateReading(id,value,len,idx);
     if(valid!=ESP_OK) return valid;
     auto& e=s_io[idx];
@@ -1202,9 +1240,12 @@ esp_err_t agent_link_push_reading(const char* id,const void* value,size_t len) {
     return SendReading(e,value,len);
 }
 esp_err_t agent_link_update_reading(const char* id,const void* value,size_t len) {
+    if(!id || !value) return ESP_ERR_INVALID_ARG;
+    // Check capacity before validating bytes: this API never retains a larger
+    // sample, so walking an arbitrarily long STR would only delay loop().
+    if(len>AGENT_LINK_READING_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
     int idx=0; const esp_err_t valid=ValidateReading(id,value,len,idx);
     if(valid!=ESP_OK) return valid;
-    if(len>AGENT_LINK_READING_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
     auto& e=s_io[idx];
     if(e.pending) ++s_stats.reading_coalesces;
     CacheReading(e,value,len); e.pending=true;

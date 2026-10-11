@@ -49,6 +49,9 @@ struct FrameView {
     ByteView payload;
 };
 bool ParseFrameView(const uint8_t* data, size_t len, FrameView& out);
+// Non-NUL UTF-8 Unicode scalar text; an empty byte range is valid. Used for STR
+// readings/actuators, while BLOB retains arbitrary binary-byte semantics.
+bool IsUtf8Text(const uint8_t* data, size_t len);
 // Return encoded byte count, or zero on invalid input / insufficient capacity.
 size_t EncodeEvent(uint8_t* out, size_t capacity, uint8_t id, const uint8_t* payload, size_t len);
 size_t EncodeResponse(uint8_t* out, size_t capacity, uint8_t id, uint8_t sequence,

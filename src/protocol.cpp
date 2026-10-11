@@ -4,6 +4,35 @@
 
 namespace agentlink {
 
+bool IsUtf8Text(const uint8_t* data, size_t len) {
+    if (!data && len) return false;
+    for (size_t offset=0; offset<len;) {
+        const uint8_t first=data[offset++];
+        if (!first) return false;
+        if (first<0x80) continue;
+        unsigned trailing=0;
+        uint8_t second_min=0x80, second_max=0xBF;
+        if (first>=0xC2 && first<=0xDF) trailing=1;
+        else if (first>=0xE0 && first<=0xEF) {
+            trailing=2;
+            if (first==0xE0) second_min=0xA0; // no overlong three-byte scalar
+            if (first==0xED) second_max=0x9F; // no UTF-16 surrogate scalar
+        } else if (first>=0xF0 && first<=0xF4) {
+            trailing=3;
+            if (first==0xF0) second_min=0x90; // no overlong four-byte scalar
+            if (first==0xF4) second_max=0x8F; // no scalar above U+10FFFF
+        } else return false;
+        if (len-offset<trailing) return false;
+        const uint8_t second=data[offset++];
+        if (second<second_min || second>second_max) return false;
+        for (unsigned i=1; i<trailing; ++i) {
+            const uint8_t next=data[offset++];
+            if (next<0x80 || next>0xBF) return false;
+        }
+    }
+    return true;
+}
+
 bool ParseFrameView(const uint8_t* data, size_t len, FrameView& out) {
     if (!data || len < kHeaderSize) return false;
 

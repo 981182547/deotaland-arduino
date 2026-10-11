@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "agent_link_platform.h"
@@ -42,6 +43,11 @@ esp_err_t agent_link_playback_configure(const agent_playback_config_t* config);
 /** Snapshot counters for the currently installed sink, from the poll thread.
  * Counters reset when the sink is replaced, not at each audio session. */
 void agent_link_playback_get_stats(agent_playback_stats_t* stats);
+/** True while a protocol TTS reply is armed or its END is still draining the
+ * core's retained PCM. False after on_audio_end, even if application/DMA audio
+ * is still playing. Read on the poll thread; use this for reply cancellation,
+ * rather than treating physical speaker occupancy as a new reply session. */
+bool agent_link_playback_active(void);
 
 #ifdef __cplusplus
 }

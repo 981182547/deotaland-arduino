@@ -5,6 +5,7 @@
 
 #include "agent_link.h"
 #include "agent_link_ota.h"
+#include "DeotalandImageUpload.h"
 
 /**
  * Arduino-style facade over the stable C API in agent_link.h.
@@ -37,8 +38,21 @@ public:
     void setPlaybackBufferMs(uint32_t milliseconds);
     esp_err_t configurePlayback(const agent_playback_config_t* config);
     agent_playback_stats_t playbackStats() const;
+    /** Protocol TTS is active; independent of the speaker's remaining DMA. */
+    bool playbackActive() const;
     esp_err_t prepareStreams(uint32_t stream_mask);
     esp_err_t prepareOta();
+    /** Optional OTA helpers. Set callbacks and inspect status from the same
+     * thread as poll(); callbacks are dispatched by poll(), never the worker. */
+    void setOtaCallback(agent_ota_progress_cb_t callback, void* context = nullptr);
+    agent_ota_status_t otaStatus() const;
+    bool otaBusy() const;
+    bool otaSupported() const;
+    bool otaNeedsReconnect() const;
+    void abortOta();
+    /** Call only after the board's own peripheral/health checks succeed. */
+    esp_err_t markOtaValid();
+    const char* runningVersion() const;
     esp_err_t streamStatus(agent_stream_t kind, agent_stream_status_t* out) const;
     esp_err_t openStream(agent_stream_t kind, const agent_stream_opts_t* opts, agent_stream_handle_t* out);
     esp_err_t writeStream(agent_stream_handle_t stream, const void* data, size_t bytes);
@@ -78,6 +92,7 @@ public:
     esp_err_t updateText(const char* id, const char* utf8);
     esp_err_t pushEvent(agent_event_t type, const uint8_t* data = nullptr, size_t length = 0);
     esp_err_t reportBattery(uint8_t percent, bool charging);
+    /** Reserved upstream selection report; returns NOT_SUPPORTED when READY. */
     esp_err_t selectAgent(const char* agent_id);
     esp_err_t notifyManifestChanged();
 

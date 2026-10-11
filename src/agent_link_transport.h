@@ -113,7 +113,7 @@ typedef struct agent_transport_s {
  * @return Pointer to the BLE transport operation table
  * @note Control plane is fully implemented.
  *       Data plane (send_stream) is ready for voice via GATT Notify,
- *       AUDIO/IMAGE via L2CAP CoC when enabled by the Core; FILE/VIDEO are unsupported
+ *       AUDIO/IMAGE via L2CAP CoC (bundled NimBLE on Arduino ESP32); FILE/VIDEO are unsupported
  */
 agent_transport_t* agent_transport_ble(void);
 bool agent_transport_ble_get_mac(uint8_t out[6]);

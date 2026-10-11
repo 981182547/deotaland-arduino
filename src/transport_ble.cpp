@@ -9,7 +9,7 @@
 //     response (0x02) -> notify 0xFFC1, event (0x03) -> notify 0xFFC4.
 // Data plane:
 //   - Voice uplink (device -> App): Service A 0xFFA0, GATT Notify 0xFFA1 (event 0x40 VoiceChunk).
-//   - TTS downlink and recording/ASR uplink: L2CAP CoC PSM 0x0081 when enabled by the Core.
+//   - TTS downlink and recording/ASR uplink: L2CAP CoC PSM 0x0081.
 // Service B 0xFFB0/0xFFB1 carries file/OTA commands; IMAGE uses CoC PSM 0x0082.
 // Public writes enqueue bounded work; only dedicated BLE workers may wait.
 #include "agent_link_transport.h"
@@ -21,6 +21,10 @@
 #include "soc/soc_caps.h"
 #endif
 
+// Ordinary Arduino builds compile the bundled NimBLE-Arduino host, including
+// CoC. The optional ESP-IDF component project can explicitly keep IDF's host.
+#include "vendor/nimble-arduino/DeotalandNimblePlatform.h"
+
 // Arduino-ESP32 3.3+ releases the controller's BLE memory during initArduino()
 // unless a linked BLE library marks it as in use before app_main().  Direct
 // NimBLE C API users must include the same marker as the bundled BLE libraries.
@@ -29,8 +33,10 @@
 #include "esp32-hal-alloc-ble-mem.h"
 #endif
 
-#if defined(ARDUINO_ARCH_ESP32) && !defined(AGENT_LINK_DISABLE_BLE) && defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED && \
-    defined(SOC_BLE_SUPPORTED) && SOC_BLE_SUPPORTED
+#if DEOTALAND_NIMBLE_ACTIVE || (defined(DEOTALAND_USE_IDF_NIMBLE) && \
+    defined(ARDUINO_ARCH_ESP32) && !defined(AGENT_LINK_DISABLE_BLE) && \
+    defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED && \
+    defined(SOC_BLE_SUPPORTED) && SOC_BLE_SUPPORTED)
 
 #define DEOTALAND_BLE_AVAILABLE 1
 
@@ -48,6 +54,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#if DEOTALAND_NIMBLE_ACTIVE
+#include "vendor/nimble-arduino/DeotalandNimble.h"
+#include "esp_bt.h"
+#include "nvs_flash.h"
+#else
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -60,6 +71,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "os/os_mbuf.h"      // os_msys_get_pkthdr / os_mbuf_copydata
+#endif
 
 extern "C" void ble_store_config_init(void);
 
@@ -221,6 +233,11 @@ std::atomic<struct ble_l2cap_chan*> s_l2cap_chan{nullptr};
 std::atomic<bool> s_l2cap_connected{false};
 std::atomic<bool> s_l2cap_stalled{false};
 constexpr uint16_t kImgPsm = 0x0082;
+// A host reset preserves the CoC server registry. NimBLE-Arduino's raw
+// create_server allocates another entry even for an existing PSM, so each
+// server must be registered once per port lifetime, rather than per sync.
+bool s_voice_server_registered = false;
+bool s_image_server_registered = false;
 std::atomic<struct ble_l2cap_chan*> s_img_chan{nullptr};
 std::atomic<bool> s_img_connected{false};
 std::atomic<bool> s_img_stalled{false};
@@ -410,9 +427,14 @@ const struct ble_gatt_svc_def s_svcs[] = {
 };
 
 esp_err_t RegisterGatt() {
-    // Arduino-ESP32 3.x initializes GAP/GATT services inside nimble_port_init().
-    // Calling ble_svc_gap_init()/ble_svc_gatt_init() again corrupts the controller's
-    // internal memory on ESP32-S3 and ends in an interrupt-watchdog reset.
+#if DEOTALAND_NIMBLE_ACTIVE
+    // The bundled raw host leaves service registration to the application.
+    // Register these exactly once per port_init, before our own services.
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+#else
+    // ESP-IDF's port already registers these services during port_init.
+#endif
     int rc = ble_gatts_count_cfg(s_svcs);
     if (rc != 0) { ESP_LOGE(TAG, "count_cfg rc=%d", rc); return ESP_FAIL; }
     rc = ble_gatts_add_svcs(s_svcs);
@@ -1081,12 +1103,19 @@ int L2capEvent(struct ble_l2cap_event* event, void* arg) {
 }
 
 esp_err_t StartL2capServer() {
-    int rc = ble_l2cap_create_server(kL2capPsm, kL2capMtu, L2capEvent,
-        reinterpret_cast<void*>(static_cast<uintptr_t>(kL2capPsm)));
-    if (rc != 0 && rc != BLE_HS_EALREADY) return ESP_FAIL;
-    rc = ble_l2cap_create_server(kImgPsm, kL2capMtu, L2capEvent,
-        reinterpret_cast<void*>(static_cast<uintptr_t>(kImgPsm)));
-    return rc == 0 || rc == BLE_HS_EALREADY ? ESP_OK : ESP_FAIL;
+    if (!s_voice_server_registered) {
+        const int rc = ble_l2cap_create_server(kL2capPsm, kL2capMtu, L2capEvent,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(kL2capPsm)));
+        if (rc != 0 && rc != BLE_HS_EALREADY) return ESP_FAIL;
+        s_voice_server_registered = true;
+    }
+    if (!s_image_server_registered) {
+        const int rc = ble_l2cap_create_server(kImgPsm, kL2capMtu, L2capEvent,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(kImgPsm)));
+        if (rc != 0 && rc != BLE_HS_EALREADY) return ESP_FAIL;
+        s_image_server_registered = true;
+    }
+    return ESP_OK;
 }
 
 bool RecSendStreamStart(uint32_t transfer_id, const char* name, size_t name_len) {
@@ -1677,9 +1706,18 @@ void OnSync() {
     if (ble_hs_util_ensure_addr(0) != 0) { ESP_LOGE(TAG, "ensure_addr failed"); return; }
     if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) { ESP_LOGE(TAG, "infer_auto failed"); return; }
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
-    if (StartL2capServer() != ESP_OK) ESP_LOGE(TAG, "CoC server registration failed");
+    if (StartL2capServer() != ESP_OK) {
+        ESP_LOGE(TAG, "CoC server registration failed; advertising withheld");
+        agent_link_status_t status = {};
+        status.phase = AGENT_LINK_PHASE_BLOCKED; status.transport = AGENT_TRANSPORT_BLE;
+        status.detail = ESP_FAIL;
+        snprintf(status.title, sizeof(status.title), "BLE data channels unavailable");
+        snprintf(status.hint, sizeof(status.hint), "Stop and restart the link; check available BLE memory");
+        if (auto cb = s_on_status.load()) cb(&status);
+        return;
+    }
 #else
-    ESP_LOGW(TAG, "L2CAP CoC is disabled by this Arduino-ESP32 core; TTS downlink is unavailable");
+    ESP_LOGW(TAG, "L2CAP CoC is disabled in the selected host configuration");
 #endif
     if (!s_stopping.load(std::memory_order_acquire)) StartAdvertising();
 }
@@ -1745,6 +1783,62 @@ void ShutdownTask(void*) {
     vTaskDelete(nullptr);
 }
 
+esp_err_t InitHost() {
+#if DEOTALAND_NIMBLE_ACTIVE
+    // NimBLE-Arduino deliberately leaves controller initialization to its
+    // caller. We own a single raw host; a separately started BLE stack must
+    // never be silently reused or torn down by this transport.
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE)
+        return ESP_ERR_INVALID_STATE;
+    esp_err_t result = nvs_flash_init();
+    // Preserve device identity and credentials if NVS needs intervention.
+    if (result != ESP_OK) return result;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
+    esp_bt_controller_config_t controller = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    controller.mode = ESP_BT_MODE_BLE;
+    controller.ble_max_conn = CONFIG_BT_NIMBLE_MAX_CONNECTIONS;
+#elif defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    controller.ble_max_act = MYNEWT_VAL(BLE_MAX_CONNECTIONS) +
+        MYNEWT_VAL(BLE_ROLE_BROADCASTER) + MYNEWT_VAL(BLE_ROLE_OBSERVER);
+#else
+    controller.nimble_max_connections = CONFIG_BT_NIMBLE_MAX_CONNECTIONS;
+#endif
+    result = esp_bt_controller_init(&controller);
+    if (result != ESP_OK) return result;
+    result = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (result != ESP_OK) {
+        (void)esp_bt_controller_deinit();
+        return result;
+    }
+#if CONFIG_BT_NIMBLE_LEGACY_VHCI_ENABLE
+    result = esp_nimble_hci_init();
+    if (result != ESP_OK) {
+        (void)esp_bt_controller_disable();
+        (void)esp_bt_controller_deinit();
+        return result;
+    }
+#endif
+    result = nimble_port_init();
+    if (result != ESP_OK) {
+#if CONFIG_BT_NIMBLE_LEGACY_VHCI_ENABLE
+        (void)esp_nimble_hci_deinit();
+#endif
+        // port_init normally tears the controller down on a host init error.
+        // Check status so rollback is safe on either implementation path.
+        if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED)
+            (void)esp_bt_controller_disable();
+        if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED)
+            (void)esp_bt_controller_deinit();
+    }
+    return result;
+#else
+    return nimble_port_init();
+#endif
+}
+
 esp_err_t ble_start(void* /*impl*/) {
     if (s_started.load()) return ESP_ERR_INVALID_STATE;
     s_stopping.store(false);
@@ -1752,10 +1846,15 @@ esp_err_t ble_start(void* /*impl*/) {
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
     s_rec_wake.Init(); s_img_wake.Init();
 #endif
-    esp_err_t result = nimble_port_init();
+    esp_err_t result = InitHost();
     if (result != ESP_OK) return result;
+#if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
+    s_voice_server_registered = false;
+    s_image_server_registered = false;
+#endif
     ble_hs_cfg.sync_cb = OnSync;
     ble_hs_cfg.reset_cb = OnReset;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
@@ -2033,7 +2132,7 @@ extern "C" void agent_transport_ble_set_data_receiver(size_t (*receive)(const ui
 #endif
 }
 
-#else  // CONFIG_BT_NIMBLE_ENABLED && SOC_BLE_SUPPORTED
+#else  // no supported BLE host for this build
 
 #define DEOTALAND_BLE_AVAILABLE 0
 
@@ -2074,4 +2173,4 @@ extern "C" bool agent_transport_ble_active(void) { return false; }
 extern "C" esp_err_t agent_transport_ble_forget(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" void agent_transport_ble_set_data_receiver(size_t (*)(const uint8_t*, size_t), bool (*)(void)) {}
 
-#endif  // CONFIG_BT_NIMBLE_ENABLED && SOC_BLE_SUPPORTED
+#endif  // supported BLE host

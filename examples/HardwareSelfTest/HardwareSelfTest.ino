@@ -163,15 +163,20 @@ void runConnectedTestStep(uint32_t now) {
       if (voice && voice_closed) { name="stream-close-idempotent"; actual=Deotaland.closeStream(voice); }
       break;
     case 18:
-    case 19:
-#if defined(CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM) && CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM > 0
-      Serial.println("SELFTEST:SKIP:CoC stream needs a peer session and separate hardware test");
-#else
-      name = link_step == 18 ? "stream-audio-core-limit" : "stream-image-core-limit";
-      expected=ESP_ERR_NOT_SUPPORTED;
-      actual=Deotaland.openStream(link_step == 18 ? AGENT_STREAM_AUDIO : AGENT_STREAM_IMAGE, &options, &unsupported);
-#endif
+    case 19: {
+      // The bundled host enables CoC independently of the Core's sdkconfig.
+      // Probe the active backend rather than testing a sketch-local Core macro.
+      const agent_stream_t kind = link_step == 18 ? AGENT_STREAM_AUDIO : AGENT_STREAM_IMAGE;
+      agent_stream_status_t status = {};
+      if (Deotaland.streamStatus(kind, &status) == ESP_OK) {
+        Serial.println("SELFTEST:SKIP:CoC stream needs a peer session and separate hardware test");
+      } else {
+        name = link_step == 18 ? "stream-audio-backend-limit" : "stream-image-backend-limit";
+        expected = ESP_ERR_NOT_SUPPORTED;
+        actual = Deotaland.openStream(kind, &options, &unsupported);
+      }
       break;
+    }
     case 20: name="selected-agent-upstream-limit"; expected=ESP_ERR_NOT_SUPPORTED; actual=Deotaland.selectAgent("agent-1"); break;
     case 21: name="stream-video-limit"; expected=ESP_ERR_NOT_SUPPORTED; actual=Deotaland.openStream(AGENT_STREAM_VIDEO, &options, &unsupported); break;
     case 22: name="stream-file-limit"; expected=ESP_ERR_NOT_SUPPORTED; actual=Deotaland.openStream(AGENT_STREAM_FILE, &options, &unsupported); break;

@@ -13,14 +13,19 @@
 #include <cstring>
 
 namespace {
-std::atomic<bool> active{false}, stopping{true}, network{false}, forgetting{false};
+std::atomic<bool> active{false}, stopping{true}, network{false};
 std::atomic<bool> initialized{false};
 std::atomic<uint32_t> epoch{0};
+// Keep accepted forget requests until flash confirms erasure. These counters
+// survive worker restarts; stop must not cancel an already accepted unbind.
+std::atomic<uint32_t> forget_requested{0}, forget_completed{0};
+bool ForgetPending() { return forget_requested.load() != forget_completed.load(); }
 uint32_t request_epoch = 0; // worker only
 char base_url[96], chip[32], firmware_rev[256], sn[37], mac[18];
 int product_id = 0;
 agent_cloud_status_t status = {};
 portMUX_TYPE status_lock = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE request_lock = portMUX_INITIALIZER_UNLOCKED;
 agentlink::detail::WorkerWake worker_wake;
 void Publish(void*, const agent_cloud_status_t& value) {
     taskENTER_CRITICAL(&status_lock); status = value; taskEXIT_CRITICAL(&status_lock);
@@ -32,7 +37,12 @@ void StorageFailure(esp_err_t result) {
     Publish(nullptr,failed);
 }
 bool Valid(void*) {
-    return !stopping.load() && !forgetting.load() && network.load() && epoch.load() == request_epoch;
+    return !stopping.load() && !ForgetPending() && network.load() && epoch.load() == request_epoch;
+}
+bool AcceptBinding(void*) {
+    // Link teardown is not an unbind. Preserve a key already issued by the
+    // platform, but never revive a binding explicitly forgotten during HTTP.
+    return !ForgetPending();
 }
 uint32_t Now(void*) { return agent_link_now_ms(); }
 esp_err_t Claim(void*, const agentlink::cloud::Config& c, cloud_claim_t* out, cloud_api_err_t* error) {
@@ -47,12 +57,27 @@ esp_err_t Auth(void*, const agentlink::cloud::Config& c, const char* key, cloud_
 }
 esp_err_t Heartbeat(void*, const char* key, cloud_api_err_t* error) { return cloud_api_heartbeat(key,error); }
 esp_err_t Save(void*, const char* key) { return cloud_cred_set_auth_key(key); }
-esp_err_t Clear(void*) { return cloud_cred_clear(); }
+esp_err_t Clear(void*) {
+    const uint32_t requested = forget_requested.load();
+    const esp_err_t result = cloud_cred_clear();
+    if (result == ESP_OK) forget_completed.store(requested);
+    return result;
+}
 void Drop(void*) { cloud_api_drop_connection(); }
 
 void Worker(void*) {
     worker_wake.attach();
-    esp_err_t result = cloud_cred_load();
+    esp_err_t result = ESP_OK;
+    // A previous stop may have encountered a flash failure while forgetting.
+    // Resolve that intent before loading/authenticating the old credential.
+    while (ForgetPending() && !stopping.load()) {
+        result = Clear(nullptr);
+        if (result != ESP_OK) {
+            StorageFailure(result);
+            worker_wake.wait(5000);
+        }
+    }
+    if (result == ESP_OK && !stopping.load()) result = cloud_cred_load();
     if (result == ESP_OK) result = cloud_api_init(base_url);
     if (result != ESP_OK) {
         StorageFailure(result);
@@ -61,11 +86,16 @@ void Worker(void*) {
     } else {
         agentlink::cloud::Session session;
         const agentlink::cloud::Config config = {product_id,sn,mac,chip,firmware_rev};
-        const agentlink::cloud::Ops ops = {nullptr,Now,Valid,Claim,Bind,Auth,Heartbeat,Save,Clear,Drop,Publish};
+        const agentlink::cloud::Ops ops = {nullptr,Now,Valid,Claim,Bind,Auth,Heartbeat,Save,Clear,Drop,Publish,AcceptBinding};
         session.begin(config,ops,cloud_cred_auth_key());
         initialized.store(true);
+        uint32_t applied_forget = forget_completed.load();
         while (!stopping.load()) {
-            if (forgetting.exchange(false)) (void)session.forget();
+            const uint32_t requested = forget_requested.load();
+            if (requested != applied_forget) {
+                applied_forget = requested;
+                if (ForgetPending()) (void)session.forget();
+            }
             if (stopping.load()) break;
             request_epoch = epoch.load();
             session.step(network.load());
@@ -73,6 +103,13 @@ void Worker(void*) {
             // and wait(), so disconnect/forget/stop cannot be lost here.
             if (!stopping.load()) worker_wake.wait(session.wait_ms(network.load()));
         }
+    }
+    // Finish one accepted erase even when stop arrived during HTTP or NVS Save.
+    // A failed attempt remains pending for the next start, without blocking
+    // teardown indefinitely or letting that start authenticate the stale key.
+    if (ForgetPending()) {
+        const esp_err_t erased = Clear(nullptr);
+        if (erased != ESP_OK) StorageFailure(erased);
     }
     // Only this task touches HTTP handles and credentials, including cleanup.
     cloud_api_deinit();
@@ -97,8 +134,10 @@ esp_err_t cloud_worker_start(const agent_platform_t* platform, const char* firmw
     if (result != ESP_OK) return result;
     snprintf(mac,sizeof(mac),"%02X:%02X:%02X:%02X:%02X:%02X",address[0],address[1],address[2],address[3],address[4],address[5]);
     product_id = platform->product_id;
-    agent_cloud_status_t initial = {}; initial.state = AGENT_CLOUD_NO_NETWORK; Publish(nullptr,initial);
-    network = false; forgetting = false; stopping = false; initialized = false; ++epoch; active = true;
+    if (!ForgetPending()) {
+        agent_cloud_status_t initial = {}; initial.state = AGENT_CLOUD_NO_NETWORK; Publish(nullptr,initial);
+    }
+    network = false; stopping = false; initialized = false; ++epoch; active = true;
     if (xTaskCreate(Worker,"al_cloud",8192,nullptr,4,nullptr) != pdPASS) {
         stopping = true; active = false; return ESP_ERR_NO_MEM;
     }
@@ -107,15 +146,26 @@ esp_err_t cloud_worker_start(const agent_platform_t* platform, const char* firmw
 void cloud_worker_network(bool ready) {
     if (network.exchange(ready) != ready) { ++epoch; worker_wake.wake(); }
 }
-void cloud_worker_stop() { stopping = true; network = false; ++epoch; worker_wake.wake(); }
+void cloud_worker_stop() {
+    // Linearize stop with forget acceptance: exit cleanup must see every
+    // request accepted before this boundary, and later requests are rejected.
+    taskENTER_CRITICAL(&request_lock);
+    stopping = true; network = false; ++epoch;
+    taskEXIT_CRITICAL(&request_lock);
+    worker_wake.wake();
+}
 bool cloud_worker_active() { return active.load(std::memory_order_acquire); }
 void cloud_worker_status(agent_cloud_status_t* out) {
     if (!out) return;
     taskENTER_CRITICAL(&status_lock); *out = status; taskEXIT_CRITICAL(&status_lock);
 }
 esp_err_t cloud_worker_forget() {
-    if (!active.load() || stopping.load() || !initialized.load()) return ESP_ERR_INVALID_STATE;
-    forgetting = true; ++epoch; worker_wake.wake(); return ESP_OK;
+    taskENTER_CRITICAL(&request_lock);
+    const bool accepted = active.load() && !stopping.load() && initialized.load();
+    if (accepted) { ++forget_requested; ++epoch; }
+    taskEXIT_CRITICAL(&request_lock);
+    if (!accepted) return ESP_ERR_INVALID_STATE;
+    worker_wake.wake(); return ESP_OK;
 }
 #elif AGENT_LINK_WIFI_AVAILABLE
 #include "cloud_worker.h"

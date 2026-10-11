@@ -1,4 +1,5 @@
 #include "ota_service.h"
+#include "vendor/nimble-arduino/DeotalandNimblePlatform.h"
 #include <cstring>
 
 // This is the only module that knows about flash partitions and the ESP32 OTA API.
@@ -11,10 +12,17 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0) && __has_include("freertos/idf_additions.h")
+#include "freertos/idf_additions.h"
+#if configSUPPORT_STATIC_ALLOCATION == 1
+#define AGENT_LINK_OTA_HAS_BUFFER_CAPS 1
+#endif
+#endif
 #include "mbedtls/sha256.h"
 #include "mbedtls/version.h"
 #include "sdkconfig.h"
@@ -25,6 +33,7 @@
 namespace agentlink {
 namespace ota {
 namespace {
+#if AGENT_LINK_HAS_OTA_WORKER
 bool s_enabled = false;
 bool s_data_supported = false;
 EventSink s_sink = nullptr;
@@ -32,17 +41,81 @@ ReliableEventSink s_reliable_sink = nullptr;
 ResumeRxHook s_resume = nullptr;
 agent_ota_progress_cb_t s_callback = nullptr;
 void* s_callback_context = nullptr;
+#endif
 char s_model[64] = {};
 
 bool Supported() {
-#if AGENT_LINK_HAS_OTA_WORKER && !defined(AGENT_LINK_DISABLE_BLE) && defined(CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM) && CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM > 0
+#if AGENT_LINK_HAS_OTA_WORKER && !defined(AGENT_LINK_DISABLE_BLE) && \
+    (DEOTALAND_NIMBLE_ACTIVE || \
+     (defined(CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM) && CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM > 0))
     return s_enabled && s_data_supported;
 #else
+#if AGENT_LINK_HAS_OTA_WORKER
+    (void)s_enabled; (void)s_data_supported;
+#endif
     return false;
 #endif
 }
 
 #if AGENT_LINK_HAS_OTA_WORKER
+// IDF can return the sole ota_0 slot even when it is the running image. Reject
+// that layout before allocating a worker or acknowledging an upgrade. Boot
+// selection also needs two sectors of otadata, even with a factory image.
+const esp_partition_t* UpdatePartition() {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!running) return nullptr;
+    const esp_partition_t* target = esp_ota_get_next_update_partition(running);
+    const esp_partition_t* otadata = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
+    return target && target->address != running->address && otadata && otadata->size >= 8192u
+        ? target : nullptr;
+}
+
+#if defined(AGENT_LINK_OTA_REQUIRE_NEWER_VERSION) && AGENT_LINK_OTA_REQUIRE_NEWER_VERSION
+// Compare the numeric release, as the upstream opt-in gate does. Accept one to
+// three components and ignore a nonempty -prerelease/+build suffix; malformed
+// numeric components and overflow are rejected instead of wrapping through sscanf.
+bool ParseVersion(const char* text, uint32_t out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!text || !*text) return false;
+    unsigned component = 0;
+    for (;;) {
+        if (*text < '0' || *text > '9') return false;
+        uint32_t value = 0;
+        while (*text >= '0' && *text <= '9') {
+            const uint32_t digit = static_cast<uint32_t>(*text++ - '0');
+            if (value > (UINT32_MAX - digit) / 10u) return false;
+            value = value * 10u + digit;
+        }
+        out[component++] = value;
+        if (!*text) return true;
+        if (*text == '.') {
+            if (component == 3) return false;
+            ++text;
+            continue;
+        }
+        if (*text != '-' && *text != '+') return false;
+        if (!*++text) return false;
+        for (; *text; ++text) {
+            const char ch = *text;
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= 'a' && ch <= 'z') || ch == '.' || ch == '-' || ch == '+')) return false;
+        }
+        return true;
+    }
+}
+
+bool IsNewerVersion(const char* candidate, const char* current) {
+    uint32_t next[3], running[3];
+    if (!ParseVersion(candidate, next)) return false;
+    // Preserve upstream recovery behavior for a nonnumeric running image version.
+    if (!ParseVersion(current, running)) return true;
+    for (unsigned i = 0; i < 3; ++i)
+        if (next[i] != running[i]) return next[i] > running[i];
+    return false;
+}
+#endif
+
 #ifndef AGENT_LINK_OTA_RX_BUFFER_BYTES
 #define AGENT_LINK_OTA_RX_BUFFER_BYTES (32u * 1024u)
 #endif
@@ -260,14 +333,34 @@ void EncodeProgress(const agent_ota_status_t& status, uint8_t payload[11]) {
 void Configure(bool enabled, bool data_channel_supported) {
 #if AGENT_LINK_HAS_OTA_WORKER
     InvalidateSession();
-#endif
     s_enabled = enabled;
     s_data_supported = data_channel_supported;
+#else
+    (void)enabled; (void)data_channel_supported;
+#endif
     if (!Supported()) Abort("disabled");
 }
-void SetEventSink(EventSink sink) { s_sink = sink; s_reliable_sink = nullptr; }
-void SetReliableEventSink(ReliableEventSink sink) { s_reliable_sink = sink; }
-void SetResumeRxHook(ResumeRxHook hook) { s_resume = hook; }
+void SetEventSink(EventSink sink) {
+#if AGENT_LINK_HAS_OTA_WORKER
+    s_sink = sink; s_reliable_sink = nullptr;
+#else
+    (void)sink;
+#endif
+}
+void SetReliableEventSink(ReliableEventSink sink) {
+#if AGENT_LINK_HAS_OTA_WORKER
+    s_reliable_sink = sink;
+#else
+    (void)sink;
+#endif
+}
+void SetResumeRxHook(ResumeRxHook hook) {
+#if AGENT_LINK_HAS_OTA_WORKER
+    s_resume = hook;
+#else
+    (void)hook;
+#endif
+}
 void SetDeviceModel(const char* model) {
     s_model[0] = '\0';
     if (!model) return;
@@ -278,11 +371,16 @@ const char* DeviceModel() { return s_model; }
 esp_err_t Prepare() {
     if (!Supported()) return ESP_ERR_NOT_SUPPORTED;
 #if AGENT_LINK_HAS_OTA_WORKER
+    if (!UpdatePartition()) return ESP_ERR_NOT_FOUND;
     if (s_worker) return ESP_OK;
-    if (!esp_ota_get_next_update_partition(nullptr)) return ESP_ERR_NOT_FOUND;
     // Retain each successful reservation on failure, so retrying is idempotent
     // and cannot invalidate pointers held by the independent RX host task.
-    if (!s_buffer) s_buffer=xStreamBufferCreate(kBufferBytes,1);
+    if (!s_buffer) {
+#if defined(AGENT_LINK_OTA_HAS_BUFFER_CAPS)
+        s_buffer=xStreamBufferCreateWithCaps(kBufferBytes,1,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+        if (!s_buffer) s_buffer=xStreamBufferCreate(kBufferBytes,1);
+    }
     if (!s_buffer) return ESP_ERR_NO_MEM;
     if (!s_progress) s_progress=xQueueCreate(8,sizeof(ProgressRecord));
     if (!s_progress) return ESP_ERR_NO_MEM;
@@ -316,7 +414,13 @@ bool Start(uint32_t firmware_size, const uint8_t sha256[32], const char* version
         if (error_code) *error_code = kErrModelMismatch;
         return false;
     }
-    s_partition = esp_ota_get_next_update_partition(nullptr);
+#if defined(AGENT_LINK_OTA_REQUIRE_NEWER_VERSION) && AGENT_LINK_OTA_REQUIRE_NEWER_VERSION
+    if (!IsNewerVersion(version, agent_link_ota_running_version())) {
+        if (error_code) *error_code = kErrVersionIncompat;
+        return false;
+    }
+#endif
+    s_partition = UpdatePartition();
     s_previous_boot = esp_ota_get_boot_partition();
     if (!s_partition || !s_previous_boot) {
         if (error_code) *error_code=kErrPartitionFail;
@@ -492,8 +596,12 @@ bool OwnsDataChannel() {
 #endif
 }
 void SetCallback(agent_ota_progress_cb_t callback, void* context) {
+#if AGENT_LINK_HAS_OTA_WORKER
     s_callback = callback;
     s_callback_context = context;
+#else
+    (void)callback; (void)context;
+#endif
 }
 bool IsSupported() { return Supported(); }
 }  // namespace ota
@@ -504,6 +612,7 @@ extern "C" void agent_link_ota_set_callback(agent_ota_progress_cb_t callback, vo
 }
 extern "C" void agent_link_ota_get_status(agent_ota_status_t* out) { agentlink::ota::GetStatus(out); }
 extern "C" bool agent_link_ota_is_busy(void) { return agentlink::ota::IsBusy(); }
+extern "C" bool agent_link_ota_needs_reconnect(void) { return agentlink::ota::OwnsDataChannel() && !agentlink::ota::IsBusy(); }
 extern "C" bool agent_link_ota_supported(void) { return agentlink::ota::IsSupported(); }
 extern "C" esp_err_t agent_link_ota_prepare(void) { return agentlink::ota::Prepare(); }
 extern "C" void agent_link_ota_abort(void) { agentlink::ota::Abort("board requested"); }

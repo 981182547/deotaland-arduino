@@ -254,7 +254,7 @@ typedef struct {
      */
     const char*              firmware_rev;
     agent_transport_t* custom_transport; ///< Required for CUSTOM, borrowed for the lifetime.
-    bool enable_ota; ///< Opt-in ESP32 OTA; requires a CoC-enabled Core and OTA partitions.
+    bool enable_ota; ///< Opt-in ESP32 OTA; requires a CoC-capable BLE backend and OTA partitions.
     const uint8_t* device_id; ///< Optional stable 16-byte ID, copied. Supply for custom hardware.
     const agent_platform_t* platform; ///< Copied, including strings; ignored by BLE.
     agent_link_status_cb_t on_status;
@@ -412,6 +412,9 @@ esp_err_t agent_link_report_battery(uint8_t percent, bool charging);
 /**
  * @brief Report the user's selected Agent ID
  * @param agent_id The selected Agent ID
+ * @note Reserved by upstream. A ready link returns NOT_SUPPORTED, without
+ *       emitting an event; an empty ID is INVALID_ARG and an offline link is
+ *       INVALID_STATE. This call does not select an Agent on the platform.
  */
 esp_err_t agent_link_report_selected_agent(const char* agent_id);
 

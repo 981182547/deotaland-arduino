@@ -1,6 +1,6 @@
-/* 进阶 ASR 状态机：需 App 发起采集，并使用启用 CoC 的 Core。
+/* 进阶 ASR 状态机：需 App 发起采集；本库自带启用 CoC 的 NimBLE 后端。
  * 这里发送合成测试 PCM，不采集麦克风。请替换 makeTestPcm 后再测试识别。
- * 普通 Core 的 AUDIO 可能返回 NOT_SUPPORTED；先用 BasicBLE 验证控制连接。
+ * 使用兼容的官方 ESP32 Arduino Core；先用 BasicBLE 验证控制连接。
  */
 #include <Deotaland.h>
 
@@ -28,7 +28,7 @@ bool retryable(esp_err_t result) {
 
 void onListen(bool start, uint32_t max_ms, void*) {
   // Called from Deotaland.poll(), on the same thread as loop().
-  if (supportError != ESP_OK) return; // 不为缺少 AUDIO 的 Core 启动无效采集任务。
+  if (supportError != ESP_OK) return; // 不为缺少 AUDIO 的后端启动无效采集任务。
   capture_requested = start;
   capture_started_at = millis();
   capture_duration = start ? max_ms : 0;
@@ -63,13 +63,13 @@ void printDiagnostic() {
     Serial.print("启动失败: "); Serial.println(Deotaland.errorName(startError));
     Serial.println(Deotaland.errorHint(startError));
   } else if (supportError == ESP_ERR_NOT_SUPPORTED) {
-    Serial.println("当前 Core 未提供 AUDIO/CoC，已停止采集任务。需使用启用 NimBLE CoC 的 Core；草图加宏或重连不能补齐。");
+    Serial.println("当前后端不支持 AUDIO/CoC，已停止采集任务。请检查 BLE 目标及本库自带的 NimBLE 配置，见 docs/BLE-COC.zh-CN.md。");
   } else if (supportError != ESP_OK) {
     Serial.print("AUDIO 能力检查失败: "); Serial.println(Deotaland.errorName(supportError));
     Serial.println(Deotaland.errorHint(supportError));
   } else {
     Serial.print("控制状态: "); Serial.println(Deotaland.stateName(Deotaland.state()));
-    Serial.println("Core 支持 AUDIO；仍需 App 打开 CoC 并发起采集。实际识别须替换 makeTestPcm。");
+    Serial.println("后端支持 AUDIO；仍需 App 打开 CoC 并发起采集。实际识别须替换 makeTestPcm。");
   }
 }
 
@@ -123,7 +123,7 @@ void loop() {
     last_pcm_at = now - 20;
     complete_capture = true;
     if (!streaming) {
-      // A failed start (for example, a Core built without L2CAP CoC) is a
+      // A failed start (for example, an unsupported transport backend) is a
       // completed capture attempt. Do not retry and flood the serial log on
       // every loop iteration; wait for the next StartCapture command.
       capture_requested = false;

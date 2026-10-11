@@ -1,8 +1,8 @@
 # API 与进阶参考
 
-适用库版本：**0.6.1**；核对日期：2026-09-28。本文对应当前源码：包含类型化读数、容量与错误查询、Wi-Fi 网络/平台状态区分，以及流、播放、OTA 和自定义传输约定。验证范围见 [0.6.1 验证记录](../tests/VALIDATION-0.6.1.md)。
+适用库版本：**0.8.1**；核对日期：2026-10-11。本文对应当前源码：包含随库编译的 NimBLE CoC、相机拍照与分块图片上传、类型化读数、Wi-Fi 状态，以及流、播放、OTA 和自定义传输约定。
 
-**升级后必须在 loop() 中调用 Deotaland.poll()。** 硬件回调在这个调用线程执行。库不包含屏幕、麦克风、相机、传感器的引脚或驱动；应用通过回调和 I/O 端点接入硬件。
+**升级后必须在 loop() 中调用 Deotaland.poll()。** 硬件回调在这个调用线程执行。通用库不绑定屏幕、麦克风、相机或传感器引脚；应用通过回调和 I/O 端点接入硬件。CameraSnapshot 示例已提供真实 ESP32 相机驱动接入，默认原版 GC2145 引脚。
 
 ## 安装与入门
 
@@ -15,7 +15,7 @@ BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。�
 | 层 | 依赖和支持范围 |
 | --- | --- |
 | 协议、清单、I/O、流会话、PCM/ADPCM | C++11 标准库，不依赖 ESP-IDF、Arduino 引脚或 RTOS |
-| 内置 BLE | Arduino-ESP32 3.x，芯片及 Core 启用 NimBLE；无 BLE 时返回不支持 |
+| 内置 BLE | Arduino-ESP32 3.x、有 BLE 控制器的芯片；随库编译 NimBLE-Arduino，CoC 默认 2；无 BLE 时返回不支持 |
 | Wi-Fi 云端 | ESP32 Wi-Fi；STA/SoftAP 配网、HTTPS 激活绑定、鉴权、心跳；尚无控制/媒体数据通道 |
 | 自定义传输 | AGENT_TRANSPORT_CUSTOM；STM32 等具有标准库和足够 RAM 的 32 位 Arduino 硬件 |
 | OTA | 显式启用的 ESP32 后端，需要 CoC 和 OTA 分区布局 |
@@ -40,7 +40,7 @@ BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。�
 自定义传输可以通过全局编译参数 `AGENT_LINK_DISABLE_BLE`、`AGENT_LINK_DISABLE_WIFI`、`AGENT_LINK_DISABLE_CLOUD`、`AGENT_LINK_DISABLE_OTA` 排除不用的后端及其驱动依赖。例如 Arduino CLI 加上 `--build-property "compiler.cpp.extra_flags=-DAGENT_LINK_DISABLE_BLE -DAGENT_LINK_DISABLE_WIFI -DAGENT_LINK_DISABLE_OTA"`。默认不关闭任何可用后端；无 Wi-Fi 的芯片自动使用不支持的桩实现。
 
 <a id="api-overview"></a>
-## API 概览（0.6.1）
+## API 概览（0.8.1）
 
 | 能力 | API / 状态 |
 | --- | --- |
@@ -54,13 +54,14 @@ BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。�
 | 统一流 | prepareStreams, openStream, writeStream, closeStream, sendStream, streamStatus |
 | 语音 | VOICE 经 GATT 0xFFA1；AUDIO 经 CoC PSM 0x0081 |
 | 图片 | IMAGE 经独立 CoC PSM 0x0082，RGB565 / JPEG 元数据 |
+| 分块图片上传 | DeotalandImageUpload：start, poll, cancel, busy, state, result, acceptedBytes；见[指南](IMAGE-UPLOAD.zh-CN.md) |
 | TTS | PCM16 / IMA-ADPCM，输出 16kHz 单声道 PCM16；configurePlayback / playbackStats、真实缓冲水位、事件 0x20 流控 |
 | 身份查询 | 命令 0x01 / deviceId；共用 NVS agent_link/dev_uuid，兼容迁移 al_dev/sn；自定义硬件指定 16 字节 device_id |
-| OTA | prepareOta、0x37 / 0x56 / 0x38，异步擦写、SHA-256、型号检查；默认关闭 |
+| OTA | prepareOta、setOtaCallback、otaStatus / otaBusy / otaSupported / otaNeedsReconnect、abortOta、markOtaValid、runningVersion；0x37 / 0x56 / 0x38；默认关闭 |
 
 setPlaybackBufferMs(ms) 声明真实播放缓冲容量，默认 400ms，支持范围为 120～120000ms，超出会截取到边界。使用内置流控的播放缓冲至少应容纳 120ms PCM。不要声明超过实际容量的数值。
 
-`configurePlayback` 注册快速返回的 write / queued 回调：write 返回实际接收的偶数字节数，0 表示本轮无空间，库保留未接收的 PCM 并继续背压；queued 返回应用队列及 DMA 中尚未播放的字节数。`on_audio_end` 在完整 PCM 全部交给应用后触发，物理播放可能尚未结束。未配置时兼容原 on_audio_out 和时间估算流控，原回调必须一次接收全部数据。完整应用缓冲示例见 [BufferedPlayback](../examples/BufferedPlayback/BufferedPlayback.ino)。
+`configurePlayback` 注册快速返回的 write / queued 回调：write 返回实际接收的偶数字节数，0 表示本轮无空间，库保留未接收的 PCM 并继续背压；queued 返回应用队列及 DMA 中尚未播放的字节数。`on_audio_end` 在完整 PCM 全部交给应用后触发，物理播放可能尚未结束。`playbackActive()` 查询协议 TTS 回复是否尚未结束（含库内待排空数据），不把应用队列或 DMA 的尾音视为新回复；用于判断取消应影响哪个会话，须在 `poll` 同一线程调用。未配置时兼容原 on_audio_out 和时间估算流控，原回调必须一次接收全部数据。完整应用缓冲示例见 [BufferedPlayback](../examples/BufferedPlayback/BufferedPlayback.ino)，真实硬件整合见 [AiotBasicAgent](../examples/AiotBasicAgent/README.md)。
 
 `updateReading(id, value, length)` 只更新固定缓存，离线和拥塞时合并为最新值，poll 稍后发送；默认最大 125 字节。PERIODIC 根据配置周期自动发送缓存值，应用仍负责采样；ON_CHANGE 精确比较完整缓存，OFF 只缓存。`pushReading` 保持即时发送接口，失败由调用方重试。超过缓存上限的值只能走 pushReading，受 MTU 限制，不能用于缓存查询或去重。重连后策略恢复 PASSTHROUGH，并重新发送缓存的最新读数。
 
@@ -78,17 +79,21 @@ setPlaybackBufferMs(ms) 声明真实播放缓冲容量，默认 400ms，支持�
 
 `maxPromptBytes()` 返回当前单条提示词可用的 UTF-8 字节数，未 READY 时为 0；默认 BLE ATT MTU 23 时通常为 14。读数还需扣除 ID 的字节数加 2 字节，不能将提示词容量直接当成读数容量。缓存上限与链路 MTU 是两个限制：缓存成功后若暂时无法放入包，后台会记录 `stats().last_error` 并保留样本，待容量或连接恢复后重试。
 
+0.8.1 对 `AGENT_VAL_STR` 统一验证 UTF-8：读数和执行器参数中的内嵌 NUL、非法或截断的编码返回参数错误。空串可用；`AGENT_VAL_BLOB` 仍可承载任意二进制。
+
 `errorName()`/`errorHint()` 解释 API 返回值；`stateName()` 解释 `agent_state_t`，不要传入 `status().phase`。`isRetryable()` 仅将 NO_MEM/TIMEOUT 视为发送拥塞候选，应在后续 loop 限频重试；初始化或资源预热时 NO_MEM 可能需要减少内存占用。`stats().last_error` 是最近记录的历史错误，成功不会自动清零，也不覆盖每个公共 API 的参数错误。动态注册端点会自动使清单更新；原地修改已注册描述符后才需显式调用 `notifyManifestChanged()`。
 
 内置 Wi-Fi 支持联网、配网和云端激活/绑定/鉴权/心跳，**仍没有云端控制/媒体通道**。云端在线为 CONNECTED，isReady() 保持 false。BOTH 返回 ESP_ERR_NOT_SUPPORTED。内置 VIDEO、FILE 和 selectAgent 也未实现，自定义后端可支持通用流类型。
 
-本次验证使用的 Arduino-ESP32 3.3.11 构建未启用 NimBLE L2CAP CoC，此时 AUDIO、IMAGE、TTS CoC 下行和 OTA 不可用；能力查询或相关操作会报告不支持，具体返回值仍取决于调用状态。需要使用启用 CoC 的 Core；在草图加宏不能改变预编译 BLE 栈。GATT 控制和 VOICE 不依赖 CoC。
+0.8.0 在普通 Arduino 构建中随库编译 NimBLE-Arduino 2.5.1，统一启用两个 CoC 通道。AUDIO、IMAGE、TTS 和显式启用的 OTA 使用这套栈，官方 Core 的预编译 CoC=0 不再限制这些业务。两个通道是同时连接上限；OTA 与 TTS 共用 PSM 0x0081。App 仍须打开相应通道。配置与协议见 [CoC 说明](BLE-COC.zh-CN.md)。GATT 控制和 VOICE 不依赖 CoC。
 
 内置 BLE 可在 begin 成功后、连接 App 之前用 `streamStatus(kind, &status)` 检查流类型支持：返回 NOT_SUPPORTED 表示当前构建缺少能力，返回 ESP_OK 只表示查询成功；流状态 UNAVAILABLE 可能只是对端未连接，不能据此判断 Core 缺功能。`prepareStreams()` 则会实际预分配缓存和任务。0.6.1 的 ImageStream、RealtimeASR、BufferedPlayback 在缺少相应 CoC 能力时停止相关示例任务，VoicePTT 独立检查 VOICE 准备结果与 TTS/CoC 限制；四例每 10 秒及串口 `?` 可重看中文诊断。通过 AUDIO 查询推断 TTS 的 CoC 支持仅适用于内置 BLE，不是 CUSTOM 后端的通用 TTS 能力检查。
 
 统一流调用顺序是 openStream(kind, opts, &handle) → writeStream(handle, bytes, count) → closeStream(handle)。同类型只有一个流，重复 open 返回当前句柄；断连或停止使流关闭。新建会话不会复用旧句柄，旧句柄不能操作新会话。IMAGE 必须给出非零宽、高；JPEG 还需要 total_bytes，RAW 的零长度自动推导为宽×高×2。close 失败时会话仍保留：暂时拥塞可重试，永久错误应停止任务，等待重连或重启后端再新建流。句柄仅限当前会话，关闭后不要继续持有并操作它。
 
 sendStream 适合整块一次入队的小对象，已有同类型流时返回状态错误。如果数据已接受而 END 暂时拥塞，返回成功并由 poll 自动重试 END，调用方不要重发数据。在排空完成前，该类型暂时不能再次 open。`streamStatus` 可查询 OPEN / DRAINING / COMPLETED / FAILED、排队字节和拒收计数；COMPLETED 表示数据交给本地栈、END 入本地队列，不代表对端 ACK。VOICE 没有线上的 END 标记，close(false) 只记录本地失败，仍排空已接收数据。分块传输见 ImageStream 示例。
+
+`DeotalandImageUpload` 适合大于排队缓存的完整照片。`start(opts, data, bytes, now_ms, timeout_ms=30000)` 验证元数据并借用缓冲区，不复制整图；在 `loop()` 中调用 `poll(millis())`，每次最多执行一个流操作，写入块不超过 512 字节。每块入队失败时保留偏移重试；超时、取消和连接代际变化会终止任务。`busy()` 为 false 后可以释放图像；Completed 代表本地接受。`cancel()` 后继续 poll 处理取消 END；永久关闭错误可能保留核心流，此时需等断线后建立新会话，不能覆盖旧流。完整接口及真实相机接入见[图片上传指南](IMAGE-UPLOAD.zh-CN.md)。
 
 ## Wi-Fi 网络状态与云端配置
 
@@ -151,17 +156,23 @@ I/O 注册表最多 32 个端点，自动生成的 led0 / motor0 / screen0 也�
 
 ## OTA
 
-包含 agent_link_ota.h，设置 config.enable_ota=true 以及准确的 model / firmware_rev；agent_link_ota_supported 查询当前构建及配置支持。OTA 进度回调在 poll 执行，flash 擦写和校验在专用任务。OTA 与 TTS 共用 PSM 0x0081，升级时应停止其他大流量任务。升级失败后重新连接再发起新 OTA，避免残余固件字节混入音频。
+包含 agent_link_ota.h，设置 config.enable_ota=true 以及准确的 model / firmware_rev；agent_link_ota_supported 查询当前构建及配置支持。OTA 进度回调在 poll 执行，flash 擦写和校验在专用任务。OTA 与 TTS 共用 PSM 0x0081，升级时应停止其他大流量任务。`agent_link_ota_needs_reconnect()` 为 true 表示已接受的升级结束/取消后仍保留共享数据通道，必须重新连接再使用 AUDIO/TTS 或发起新 OTA，避免残余固件字节混入音频；未曾取得通道的 START 拒绝不会触发该状态。
 
-可在 begin 后调用 `prepareOta()`，提前分配 32 KiB 接收环、4 KiB 内部 RAM 写缓冲、8 KiB 任务栈和事件队列；资源保留到**设备重启**，Deotaland.end/reset 不释放这组常驻资源。未预热时兼容首次 START 创建。写入聚合为 4 KiB，支持时默认按写入进度擦除；每次 poll 最多派发一次 OTA 进度。预热不能消除 ESP-IDF 内部申请或 Flash 对系统实时性的影响。
+Arduino 可直接使用 `Deotaland.setOtaCallback(cb)`、`otaStatus()`、`otaBusy()`、`otaSupported()`、`otaNeedsReconnect()`、`abortOta()`、`markOtaValid()` 和 `runningVersion()`，与对应 C API 共用同一实例。状态和回调都从调用 `poll()` 的线程访问；健康确认须由应用自己的自检决定。
+
+`prepareOta()` 和 START 都要求更新分区与运行分区地址不同，并且存在至少 8 KiB 的 `otadata`。缺少布局时预热返回 `ESP_ERR_NOT_FOUND`，START 不会接管媒体通道；镜像字节数还须小于等于目标槽容量。首次 USB 上传即应选择正确双槽布局。
+
+可在 begin 后调用 `prepareOta()`，提前分配 32 KiB 接收环、4 KiB 内部 RAM 写缓冲、8 KiB 任务栈和事件队列；IDF 5.1+ 且支持静态对象分配时，接收环优先使用 PSRAM，分配失败回退内部 RAM。写缓冲和任务栈始终位于内部 RAM。资源保留到**设备重启**，Deotaland.end/reset 不释放这组常驻资源。未预热时兼容首次 START 创建。写入聚合为 4 KiB，支持时默认按写入进度擦除；每次 poll 最多派发一次 OTA 进度。预热不能消除 ESP-IDF 内部申请或 Flash 对系统实时性的影响。
+
+可全局定义 `AGENT_LINK_OTA_REQUIRE_NEWER_VERSION=1`，只接受比运行镜像更新的数字版本；默认关闭。该比较使用 `esp_app_desc.version`，独立于协议字段 `config.firmware_rev`。格式为 1～3 个 uint32 数字段，例如 `1.2.3`；非空 `-prerelease` / `+build` 后缀不参与排序，非法或溢出的目标版本被拒绝。它不提供完整 SemVer 预发行排序。此宏必须用于所有库编译单元，例如 Arduino CLI 的 `--build-property "compiler.cpp.extra_flags=-DAGENT_LINK_OTA_REQUIRE_NEWER_VERSION=1"`，只在草图中写 `#define` 不会改变库编译结果。
 
 启用引导回滚时，应用完成硬件自检后调用 agent_link_ota_mark_valid；库不会代替应用判定固件健康。
 
 应持续 poll，直到成功终态被传输后端接受；随后后台约 2 秒后重启。end/reset 或断连可取消尚未重启的会话，等待 canBegin 后再重新 begin；直接重新初始化不会取消正在清理的 OTA。OTA 命令响应走 Service B 的 0xFFB1，即使命令从 0xFFC1 写入，也须订阅 0xFFB1 响应。
 
-协议不按 sequence 缓存并重放命令结果，超时重发可能再次执行动作；执行器建议接受明确目标值，例如“设为关闭”，避免“切换一次”在重传后产生反效果。
+除最近一条成功 `0x05 VoiceReply` 的确切连续重试会去重并应答外，协议不提供通用命令事务缓存，超时重发可能再次执行动作；执行器建议接受明确目标值，例如“设为关闭”，避免“切换一次”在重传后产生反效果。
 
-## 示例与验证
+## 示例与实机联调
 
 - BasicBLE：状态、电量与设备命令。
 - CachedSensor：类型化温度缓存、离线合并、重连同步及错误诊断。
@@ -171,18 +182,21 @@ I/O 注册表最多 32 个端点，自动生成的 led0 / motor0 / screen0 也�
 - VoicePTT / RealtimeASR：按键和采样状态机，使用统一 VOICE / AUDIO 流。
 - BufferedPlayback：固定播放环、部分接收、真实水位及非阻塞硬件驱动接入；默认驱动返回 0，须替换板级实现才会播放。
 - ImageStream：通用流和逐步重试。
+- CameraSnapshot：真实 GC2145/ESP32 相机、后台 JPEG 编码、camera0 端点和分块上传。
+- StoredJpegUpload：Flash 中的真实 JPEG，无需相机验证收图。
+- ImageSequence：RGB565 测试图序列、上传进度及取消。
+- CoCDiagnostics：业务流支持、连接状态及队列诊断。
+- CoCOtaUpdate：OTA 显式启用、预热、进度、取消及健康确认。
 - CustomTransport：没有 ESP-IDF 的 UART 适配器。
 - BasicWiFi：预设 SSID/密码连接路由器，通过库状态查看 IP、配网进度与后台错误。
 - WiFiProvisioning：独立 Wi-Fi 配网。
 - CloudActivation：平台配置、激活码、连接进度、设备 UUID 和忘记绑定。
 - LifecycleSelfTest / HardwareSelfTest：板端集成检查。
 
-以上共 16 个示例，打开入口和硬件替换点见 [完整索引](../examples/README.zh-CN.md)。语音示例默认产生合成 PCM，图片示例使用 2×2 测试图；没有接入真实麦克风、相机或扬声器驱动。
+以上共 21 个示例，打开入口和硬件替换点见 [完整索引](../examples/README.zh-CN.md)。语音示例默认产生合成 PCM，ImageStream 使用 2×2 测试图；CameraSnapshot 接入真实相机，麦克风和扬声器仍需自己的驱动。
 
-从源码仓库执行 tests/run-host-tests.ps1（MSVC）或 tests/run-host-tests.sh（GCC/Clang），可编译实际 src/*.cpp，验证队列、协议、MTU、重试和生命周期，并检查公共头可由 C 使用。run-network-optimization-tests.ps1 覆盖网络/云端状态组合及过期 IP 事件；run-audit-tests.ps1 覆盖调度与零堆分配压力；run-service-tests.ps1 覆盖音频流控等。测试程序和脚本不包含在 Arduino 安装 ZIP 中，运行方法见 [测试说明](../tests/README.md)。
+Wi-Fi 控制/媒体业务通道仍未实现；相机板与配套 App 尚未完成实机联调。真实无线、CoC 收图、音视频和 OTA 需在目标硬件上检查，编译通过不替代实测。
 
-当前 [0.6.1 验证记录](../tests/VALIDATION-0.6.1.md) 包括相关主机回归、Host ASAN、8 个 S3 示例及 H2/STM32 两个编译目标。Wi-Fi 控制/媒体业务通道、指定板卡驱动及真实无线、CoC、音视频、OTA、长期稳定性仍待实现或硬件联调；编译和主机测试不替代实测。
-
-仓库内 extras/idf-reference 是早期板级快照，不参与编译，也不装入安装 ZIP；本工作区的上游板例位于 Agent_link-main/firmware/boards。库本身不依赖这些目录。tests/package-library.ps1 可生成含源码、示例、文档及验证记录的 Arduino 安装包，不包含测试程序和编译产物。
+从源码仓库生成 Arduino 安装包可运行 `tools/package-library.ps1`，再用 `tools/check-library-package.py` 检查包结构、文档链接及私有头文件。完整命令见 [打包说明](../README.md#生成安装包)。这两个维护工具不装入安装 ZIP。
 
 许可证见 [LICENSE](../LICENSE)。

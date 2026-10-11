@@ -1,5 +1,5 @@
 /* 图片分块练习：发送 2x2 测试图，无相机采集。需 App 打开 IMAGE CoC 通道。
- * 普通 Core 未启用 CoC 时返回 NOT_SUPPORTED，安装其他 BLE 库不能补上该能力。
+ * 本库自带启用 CoC 的 NimBLE 后端；兼容的官方 ESP32 Arduino Core 即可使用。
  * 写失败时保留原块和偏移，下轮重试；ESP_OK 仅表示本地接受。
  */
 #include <Deotaland.h>
@@ -22,13 +22,13 @@ void printDiagnostic() {
     Serial.print("启动失败: "); Serial.println(Deotaland.errorName(startError));
     Serial.println(Deotaland.errorHint(startError));
   } else if (supportError == ESP_ERR_NOT_SUPPORTED) {
-    Serial.println("当前 Core 未提供 IMAGE/CoC，已停止图片任务。需使用启用 NimBLE CoC 的 Core；草图加宏或重连不能补齐。");
+    Serial.println("当前后端不支持 IMAGE/CoC，已停止图片任务。请检查 BLE 目标及本库自带的 NimBLE 配置，见 docs/BLE-COC.zh-CN.md。");
   } else if (supportError != ESP_OK) {
     Serial.print("IMAGE 能力检查失败: "); Serial.println(Deotaland.errorName(supportError));
     Serial.println(Deotaland.errorHint(supportError));
   } else {
     Serial.print("控制状态: "); Serial.println(Deotaland.stateName(Deotaland.state()));
-    Serial.println("Core 支持 IMAGE；传图仍需 App 打开 IMAGE CoC 通道，ESP_OK 仅代表本地接受。");
+    Serial.println("后端支持 IMAGE；传图仍需 App 打开 IMAGE CoC 通道，ESP_OK 仅代表本地接受。");
   }
 }
 

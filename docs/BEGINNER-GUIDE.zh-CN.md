@@ -1,18 +1,18 @@
 # 中文入门指南
 
-适用库版本：**0.6.1**；核对日期：2026-09-28。内容已对照当前源码和示例；编译与实测边界见 [0.6.1 验证记录](../tests/VALIDATION-0.6.1.md)。文中的 Core 版本是已验证基线，不表示只有该版本可用，也不表示它是当前最新 Core。
+适用库版本：**0.8.1**；核对日期：2026-10-11。内容对应当前源码和示例。文中的 Core 版本是已验证的编译基线，不表示只有该版本可用，也不表示它是当前最新 Core。
 
 BLE 路线先看到 READY 和一条模拟读数，再接入真实传感器；Wi-Fi 路线先连接路由器取得 IP，再配置云端激活。你可以直接从第 6 节开始使用 Wi-Fi，不需要先做 BLE 配对。
 
 ## 1. 准备与安装
 
-准备可传数据的 USB 线和 Arduino IDE，再按路线选择开发板：BLE 练习需要有 BLE/NimBLE 支持的 ESP32 及兼容 Agent Link 的 App；Wi-Fi 练习需要有 Wi-Fi 的 ESP32 和可连接的路由器，BasicWiFi 不需要 BLE 或 Agent Link App。本文的编译基线是 ESP32-S3 + Arduino-ESP32 3.3.11。库的便携核心还能用于 STM32 自定义传输，但那需要自行实现桥接，不适合作为第一课。
+准备可传数据的 USB 线和 Arduino IDE，再按路线选择开发板：BLE 练习需要有 BLE 控制器的 ESP32 及兼容 Agent Link 的 App；Wi-Fi 练习需要有 Wi-Fi 的 ESP32 和可连接的路由器，BasicWiFi 不需要 BLE 或 Agent Link App。本文的编译基线是 ESP32-S3 + Arduino-ESP32 3.3.12。库的便携核心还能用于 STM32 自定义传输，但那需要自行实现桥接，不适合作为第一课。
 
-在开发板管理器安装 Espressif 的 `esp32` Core。库使用 Core 自带 NimBLE C 接口，不需要再装 `NimBLE-Arduino`；额外安装它不能为 Core 打开 CoC。不要把 `extras/idf-reference` 当作 Arduino 库安装。
+在开发板管理器安装 Espressif 的 `esp32` Core，再安装本库。0.8.1 内置固定版本的 NimBLE-Arduino 源码，默认启用两个 CoC 通道，不需要另装 NimBLE-Arduino、修改 Core 配置或重编译 SDK。一个固件由本库管理 BLE 栈；不要再初始化 BLEDevice 或另一个 NimBLEDevice 栈。
 
 用“Sketch → Include Library → Add .ZIP Library”选择安装包。手动安装时目录应是 `Sketchbook/libraries/deotaland-arduino/src/Deotaland.h`，而不是多套一层同名目录。重开 IDE，从 File → Examples 找到本库。[官方安装说明](https://support.arduino.cc/hc/en-us/articles/5145457742236-Install-libraries-in-the-Arduino-IDE)
 
-安装后确认 `library.properties` 中的 `version=0.6.1`。若找不到 `updateFloat` 或 `status().wifi_connected`，查看 IDE 详细编译输出采用的库路径，排除旧副本。`config.firmware_rev` 是你自己的设备固件版本，不必跟随库版本填写。
+安装后确认 `library.properties` 中的 `version=0.8.1`。若找不到 `DeotalandImageUpload`、`updateFloat` 或 `status().wifi_connected`，查看 IDE 详细编译输出采用的库路径，排除旧副本。`config.firmware_rev` 是你自己的设备固件版本，不必跟随库版本填写。
 
 选择与你的实际芯片一致的板型、端口、Flash 大小和分区。完整构建含 TLS，默认的小应用分区可能放不下；本次 S3 编译使用 `min_spiffs`，应用槽 1,966,080 字节并保留双槽。按实际 Flash 选择，不能为了通过编译虚填容量。[Espressif 工具菜单](https://docs.espressif.com/projects/arduino-esp32/en/latest/guides/tools_menu.html)
 
@@ -109,7 +109,9 @@ if (status.wifi_portal_active) Serial.println(status.hint); // 实际配网热�
 
 CloudActivation 默认使用已保存凭据或热点配网；若希望它也预设 SSID/密码，把上面 `wifi` 和 `config.wifi = &wifi` 加到其 setup 的 begin 之前。不要假设 BasicWiFi 中写在固件里的凭据一定已持久化到 NVS。
 
-语音/图片示例放在控制链路练习之后。VOICE 使用 GATT，但测试程序产生的是合成音；AUDIO、IMAGE、TTS 和 OTA 要求启用 CoC 的 Core 以及相应 App 通道。VoicePTT、RealtimeASR、ImageStream、BufferedPlayback 会在启动后检查所需能力，每 10 秒或输入 `?` 可重新查看诊断。库不会替你选择 I2S、摄像头或扬声器引脚。每个进阶示例的替换点见 [索引](../examples/README.zh-CN.md)。
+语音/图片示例放在控制链路练习之后。VOICE 使用 GATT，但测试程序产生的是合成音；AUDIO、IMAGE、TTS 和 OTA 使用内置 CoC 栈，仍要求 App 打开相应通道。VoicePTT、RealtimeASR、ImageStream、BufferedPlayback 会在启动后检查所需能力，每 10 秒或输入 `?` 可重新查看诊断。库不会替你选择 I2S、摄像头或扬声器引脚。每个进阶示例的替换点见 [索引](../examples/README.zh-CN.md)。
+
+先用 [StoredJpegUpload](../examples/StoredJpegUpload/StoredJpegUpload.ino) 验证无需相机的真实 JPEG 收图；[CoCDiagnostics](../examples/CoCDiagnostics/CoCDiagnostics.ino) 查看能力和通道状态。真实相机使用 [CameraSnapshot](../examples/CameraSnapshot/CameraSnapshot.ino)：核对引脚并启用 PSRAM。连接 App 后用串口 `c`、实体按钮或 App 的 `camera0=true` 拍照上传；后台负责采集/编码，主循环分块发送，完整步骤见[图片上传指南](IMAGE-UPLOAD.zh-CN.md)。[ImageSequence](../examples/ImageSequence/ImageSequence.ino) 演示有限连续图片、进度和取消，ImageStream 保留为 2×2 测试图练习。配置与协议见 [CoC 说明](BLE-COC.zh-CN.md)。
 
 ## 7. 不容易出错的 loop
 
@@ -124,7 +126,7 @@ CloudActivation 默认使用已保存凭据或热点配网；若希望它也预�
 
 | 现象 | 先检查与处理 |
 | --- | --- |
-| 找不到头文件、新方法或 Wi-Fi 状态字段 | 检查库目录结构、实际编译路径及 0.6.1 版本 |
+| 找不到头文件、新方法或 Wi-Fi 状态字段 | 检查库目录结构、实际编译路径及 0.8.1 版本 |
 | Sketch too big | 按真实 Flash 容量选择足够大的应用分区，参考第 1 节 |
 | 上传后串口空白 | 检查板卡对应的 USB/CDC、端口、115200；打开串口后复位或等待周期诊断 |
 | begin / streamStatus 返回 NOT_SUPPORTED | 检查芯片、Core、所选传输与 CoC 支持；不能靠重试补齐能力 |
@@ -132,10 +134,11 @@ CloudActivation 默认使用已保存凭据或热点配网；若希望它也预�
 | updateXXX 成功但没有读数 | 检查端点 ID/方向/类型、持续 poll、App 的上报策略和当前包容量 |
 | 提示词/读数过长 | 按 UTF-8 字节检查 maxPromptBytes 与 MTU；读数还占用 ID 字节数加 2 字节 |
 | Wi-Fi 不知道是否连上或找不到热点 | 查 wifi_connected、wifi_ip、wifi_portal_active 和 title/hint，不用 isReady 判断路由器连接 |
-| Wi-Fi 在线但 isReady=false | 0.6.1 尚无 Wi-Fi 控制/媒体数据通道；当前支持联网、配网与平台激活/鉴权/心跳 |
+| Wi-Fi 在线但 isReady=false | 尚无 Wi-Fi 控制/媒体数据通道；当前支持联网、配网与平台激活/鉴权/心跳 |
+| 相机图片无法上传 | 看 CameraSnapshot 诊断，确认 PSRAM/接线、IMAGE 能力、App 的 CoC 0x0082 通道及上传返回值 |
 | 没声音或识别为噪声 | VoicePTT/RealtimeASR 默认是合成测试音；BufferedPlayback 无扬声器驱动，需按真实硬件接入 |
 | 重连后旧 stream 句柄报错 / duplicate id | 重新打开当前会话的流；I/O 端点不要每次连接重复注册，变更配置时才 reset |
 
 先检查本次 API 返回值，再看 `state()/isReady()` 或 Wi-Fi 网络字段。`stats().last_error` 是最近一次记录的历史错误，成功不会自动清零；它不代表当前连接必然失败。不要在日志中输出 Wi-Fi 密码、平台密钥或完整私密提示词。
 
-库中的状态、防错和示例诊断已经改进；Wi-Fi 业务数据通道、指定板卡驱动及真实无线、CoC、音视频、OTA、长期稳定性仍待后续实现或实测。[0.6.1 验证记录](../tests/VALIDATION-0.6.1.md) 记录 8 个 S3 示例及 H2/STM32 两个目标的编译结果，不能视为这些硬件功能已通过验收。API 的预算、内存、媒体流、OTA 和自定义传输约定见 [进阶参考](REFERENCE.zh-CN.md)。
+CameraSnapshot 已提供设备端采集、编码和上传流程；相机板与配套 App 尚未完成实机联调，真实收图与长期稳定性仍需实测，Wi-Fi 业务数据通道仍未实现。API 的预算、内存、媒体流、OTA 和自定义传输约定见 [进阶参考](REFERENCE.zh-CN.md)。

@@ -71,7 +71,7 @@ void printDiagnostic() {
     Serial.print("控制状态: "); Serial.println(Deotaland.stateName(Deotaland.state()));
     Serial.println("VOICE 上传需 App 订阅 0xFFA1；收到的 TTS 仅计数并丢弃，不会播放。");
     if (ttsSupportError == ESP_ERR_NOT_SUPPORTED)
-      Serial.println("当前 Core 未提供 CoC，TTS 下行不可用。VOICE 上传可继续使用，无需 CoC。");
+      Serial.println("当前后端不支持 CoC，TTS 下行不可用。检查本库自带的 NimBLE 配置；VOICE 上传无需 CoC。");
     else if (ttsSupportError != ESP_OK) {
       Serial.print("TTS/CoC 能力检查失败: "); Serial.println(Deotaland.errorName(ttsSupportError));
     }

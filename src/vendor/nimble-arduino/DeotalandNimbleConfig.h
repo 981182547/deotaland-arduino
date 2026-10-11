@@ -1,0 +1,52 @@
+#pragma once
+
+// This header is included by the bundled nimconfig.h, after sdkconfig.h.
+// Override host settings in every host translation unit, rather than relying
+// on a sketch macro that cannot configure separately compiled library files.
+// The official Core's Bluetooth controller settings remain unchanged.
+#undef CONFIG_BT_NIMBLE_ENABLED
+#define CONFIG_BT_NIMBLE_ENABLED 1
+#undef CONFIG_BT_NIMBLE_ROLE_CENTRAL
+#define CONFIG_BT_NIMBLE_ROLE_CENTRAL 0
+#undef CONFIG_BT_NIMBLE_ROLE_OBSERVER
+#define CONFIG_BT_NIMBLE_ROLE_OBSERVER 0
+#undef CONFIG_BT_NIMBLE_ROLE_PERIPHERAL
+#define CONFIG_BT_NIMBLE_ROLE_PERIPHERAL 1
+#undef CONFIG_BT_NIMBLE_ROLE_BROADCASTER
+#define CONFIG_BT_NIMBLE_ROLE_BROADCASTER 1
+#undef CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+#define CONFIG_BT_NIMBLE_MAX_CONNECTIONS 1
+#undef CONFIG_NIMBLE_MAX_CONNECTIONS
+#define CONFIG_NIMBLE_MAX_CONNECTIONS 1
+#undef CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM
+#define CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM 2
+#undef MYNEWT_VAL_BLE_L2CAP_COC_MAX_NUM
+#undef MYNEWT_VAL_BLE_L2CAP_COC_MPS
+#define MYNEWT_VAL_BLE_L2CAP_COC_MPS 512
+
+// Reserve bounded internal RAM pools. A 576-byte block has room for a
+// 512-byte CoC SDU plus packet/mbuf headers and L2CAP framing.
+#undef CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT
+#define CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT 24
+#undef CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT
+#define CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT 24
+#undef CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE
+#define CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE 256
+#undef CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT
+#define CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT 32
+#undef CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE
+#define CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE 576
+#undef CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE
+#define CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 6144
+#undef CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU
+#define CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU 255
+
+// These modes are unused by Agent Link. Keep their configuration uniform
+// even when building against an SDK that has different host defaults.
+#undef CONFIG_BT_NIMBLE_EXT_ADV
+#define CONFIG_BT_NIMBLE_EXT_ADV 0
+#undef CONFIG_BT_NIMBLE_ENABLE_PERIODIC_ADV
+#define CONFIG_BT_NIMBLE_ENABLE_PERIODIC_ADV 0
+#undef CONFIG_BT_NIMBLE_MESH
+#undef CONFIG_BT_NIMBLE_EATT_CHAN_NUM
+#define CONFIG_BT_NIMBLE_EATT_CHAN_NUM 0

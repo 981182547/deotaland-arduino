@@ -60,6 +60,18 @@ esp_err_t Session::forget() {
     }
     return result;
 }
+void Session::persist(bool network) {
+    const bool clearing = stage_ == Clear;
+    const esp_err_t result = clearing ? ops_.clear(ops_.ctx) : ops_.save(ops_.ctx,key_);
+    if (result != ESP_OK) {
+        cloud_api_err_t error = {}; error.code = result;
+        snprintf(error.message,sizeof(error.message),"Credential storage failed");
+        failure(error,AGENT_CLOUD_FAULT); return;
+    }
+    accepted(); stage_ = clearing ? Claim : Auth;
+    later(0);
+    publish(network ? AGENT_CLOUD_BOUND : AGENT_CLOUD_NO_NETWORK);
+}
 uint32_t Session::wait_ms(bool network) const {
     // Storage retries survive network loss; all other work requires a link.
     if (stage_ != Persist && stage_ != Clear) {
@@ -75,16 +87,7 @@ void Session::step(bool network) {
     // Keep retrying the same key; the platform need not issue it a second time.
     if (stage_ == Persist || stage_ == Clear) {
         if (static_cast<int32_t>(now - due_) < 0) return;
-        const bool clearing = stage_ == Clear;
-        const esp_err_t result = clearing ? ops_.clear(ops_.ctx) : ops_.save(ops_.ctx,key_);
-        if (result != ESP_OK) {
-            cloud_api_err_t error = {}; error.code = result;
-            snprintf(error.message,sizeof(error.message),"Credential storage failed");
-            failure(error,AGENT_CLOUD_FAULT); return;
-        }
-        accepted(); stage_ = clearing ? Claim : Auth;
-        later(0);
-        publish(network ? AGENT_CLOUD_BOUND : AGENT_CLOUD_NO_NETWORK);
+        persist(network);
         return;
     }
     if (!network) {
@@ -120,7 +123,21 @@ void Session::step(bool network) {
         if (elapsed >= code_ttl_ || code_ttl_ - elapsed <= 20) { stage_ = Claim; later(0); return; }
         cloud_bind_t bind = {};
         const esp_err_t result = ops_.bind(ops_.ctx,config_,code_,&bind,&error);
-        if (!ops_.valid(ops_.ctx)) return;
+        const bool current = ops_.valid(ops_.ctx);
+        if (result == ESP_OK && bind.state == CLOUD_BIND_BOUND) {
+            // This key belongs to our device identity even if WiFi disappeared
+            // while the request completed. Forget still rejects obsolete keys.
+            if (ops_.accept_binding ? !ops_.accept_binding(ops_.ctx) : !current) return;
+            accepted();
+            snprintf(key_,sizeof(key_),"%s",bind.auth_key);
+            if (!key_[0]) { error.code=-1; failure(error,AGENT_CLOUD_FAULT); return; }
+            code_[0] = 0; stage_ = Persist; later(0);
+            // Save once before returning: stop() may prevent another step.
+            // Failed writes retain this same key in Persist for retry.
+            persist(current);
+            return;
+        }
+        if (!current) return;
         if (result != ESP_OK) {
             // Account for request latency using the real clock, not polling count.
             if (error.code > 0) failure(error,AGENT_CLOUD_FAULT);
@@ -128,11 +145,7 @@ void Session::step(bool network) {
             return;
         }
         accepted();
-        if (bind.state == CLOUD_BIND_BOUND) {
-            snprintf(key_,sizeof(key_),"%s",bind.auth_key);
-            if (!key_[0]) { error.code=-1; failure(error,AGENT_CLOUD_FAULT); return; }
-            code_[0] = 0; stage_ = Persist; later(0); publish(AGENT_CLOUD_BOUND);
-        } else if (bind.state == CLOUD_BIND_EXPIRED) { stage_ = Claim; later(0); }
+        if (bind.state == CLOUD_BIND_EXPIRED) { stage_ = Claim; later(0); }
         else {
             if (bind.remaining_ttl) {
                 const uint32_t spent = (ops_.now(ops_.ctx)-code_at_)/1000;

@@ -130,8 +130,9 @@ esp_err_t agent_link_update_reading(const char* id, const void* value, size_t le
 
 /** Like update_reading, but also checks the registered type before caching.
  * A type mismatch returns INVALID_ARG even when both types have the same width.
- * BOOL accepts only 0/1; F32/VEC2/VEC3 reject NaN/Inf. STR may be empty (len=0,
- * value still non-NULL); the terminating NUL is not part of a string reading.
+ * BOOL accepts only 0/1; F32/VEC2/VEC3 reject NaN/Inf. STR requires well-formed
+ * UTF-8 without embedded NUL and may be empty (len=0, value still non-NULL);
+ * the terminating NUL is not part of a string reading. Use BLOB for binary bytes.
  * Neither range hints nor args_schema/enum_json are runtime validators. */
 esp_err_t agent_link_update_reading_typed(const char* id, agent_val_t type,
                                           const void* value, size_t len);

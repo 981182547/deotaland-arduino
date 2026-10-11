@@ -32,8 +32,17 @@ void DeotalandClass::end() {
 bool DeotalandClass::canBegin() const { return agent_link_can_begin(); }
 esp_err_t DeotalandClass::configurePlayback(const agent_playback_config_t* c) { return agent_link_playback_configure(c); }
 agent_playback_stats_t DeotalandClass::playbackStats() const { agent_playback_stats_t s={}; agent_link_playback_get_stats(&s); return s; }
+bool DeotalandClass::playbackActive() const { return agent_link_playback_active(); }
 esp_err_t DeotalandClass::prepareStreams(uint32_t mask) { return agent_link_prepare_streams(mask); }
 esp_err_t DeotalandClass::prepareOta() { return agent_link_ota_prepare(); }
+void DeotalandClass::setOtaCallback(agent_ota_progress_cb_t callback, void* context) { agent_link_ota_set_callback(callback,context); }
+agent_ota_status_t DeotalandClass::otaStatus() const { agent_ota_status_t s={}; agent_link_ota_get_status(&s); return s; }
+bool DeotalandClass::otaBusy() const { return agent_link_ota_is_busy(); }
+bool DeotalandClass::otaSupported() const { return agent_link_ota_supported(); }
+bool DeotalandClass::otaNeedsReconnect() const { return agent_link_ota_needs_reconnect(); }
+void DeotalandClass::abortOta() { agent_link_ota_abort(); }
+esp_err_t DeotalandClass::markOtaValid() { return agent_link_ota_mark_valid(); }
+const char* DeotalandClass::runningVersion() const { return agent_link_ota_running_version(); }
 esp_err_t DeotalandClass::streamStatus(agent_stream_t kind,agent_stream_status_t* out) const { return agent_link_stream_get_status(kind,out); }
 esp_err_t DeotalandClass::updateReading(const char* id,const void* value,size_t n) { return agent_link_update_reading(id,value,n); }
 

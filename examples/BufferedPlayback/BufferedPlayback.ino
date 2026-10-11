@@ -109,7 +109,7 @@ void printDiagnostic() {
     Serial.print("启动失败: "); Serial.println(Deotaland.errorName(startError));
     Serial.println(Deotaland.errorHint(startError));
   } else if (supportError == ESP_ERR_NOT_SUPPORTED) {
-    Serial.println("当前 Core 未提供 CoC，TTS 下行不可用，已停止播放任务。需使用启用 NimBLE CoC 的 Core；草图加宏不能补齐。");
+    Serial.println("当前后端不支持 CoC，TTS 下行不可用，已停止播放任务。请检查 BLE 目标及本库自带的 NimBLE 配置，见 docs/BLE-COC.zh-CN.md。");
   } else if (supportError != ESP_OK) {
     Serial.print("CoC 能力检查失败: "); Serial.println(Deotaland.errorName(supportError));
     Serial.println(Deotaland.errorHint(supportError));
@@ -134,7 +134,7 @@ void setup() {
   if (!started) return;
   agent_stream_status_t status = {};
   // 本例使用内置 BLE：AUDIO 与 TTS 共用 CoC 编译能力。此检查不是 CUSTOM 后端的通用 TTS 探测。
-  // 只看返回码，连接前的 UNAVAILABLE 状态不代表 Core 缺少能力。
+  // 只看返回码，连接前的 UNAVAILABLE 状态不代表后端缺少能力。
   supportError = Deotaland.streamStatus(AGENT_STREAM_AUDIO, &status);
   if (supportError != ESP_OK) return;
   agent_playback_config_t playback = {};

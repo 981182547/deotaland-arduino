@@ -1,4 +1,9 @@
 .build/
 .build-network-optimization/
 **/build/
+**/__pycache__/
+*.pyc
+*.d
+*.o
+*.obj
 *.zip

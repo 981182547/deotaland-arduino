@@ -15,7 +15,7 @@ struct Config {
 struct Ops {
     void* ctx;
     uint32_t (*now)(void*);
-    // Rechecked AFTER each request. Reject replies from a stopped/forgotten link.
+    // Rechecked AFTER each request. Reject status replies from an obsolete link.
     bool (*valid)(void*);
     esp_err_t (*claim)(void*, const Config&, cloud_claim_t*, cloud_api_err_t*);
     esp_err_t (*bind)(void*, const Config&, const char*, cloud_bind_t*, cloud_api_err_t*);
@@ -25,6 +25,10 @@ struct Ops {
     esp_err_t (*clear)(void*);
     void (*drop)(void*);
     void (*publish)(void*, const agent_cloud_status_t&);
+    // A successful BOUND reply contains the credential needed on the next boot.
+    // Network loss/stop must not discard it; only an explicit forget does.
+    // If omitted, valid() retains its original cancellation semantics.
+    bool (*accept_binding)(void*) = nullptr;
 };
 class Session {
 public:
@@ -52,5 +56,6 @@ private:
     void later(uint32_t milliseconds);
     void codeStatus();
     bool revoked(const cloud_api_err_t& error);
+    void persist(bool network);
 };
 } }
