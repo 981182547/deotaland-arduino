@@ -601,7 +601,7 @@ esp_err_t EnqueueControl(uint16_t handle, const uint8_t* data, size_t len, uint3
 #endif
     if (!data || len == 0) return ESP_ERR_INVALID_ARG;
     if (!SessionAlive(epoch) || handle == 0 || !s_control_running.load()) return ESP_ERR_INVALID_STATE;
-    if (handle == s_h_evt && !s_event_notify_enabled) return ESP_ERR_INVALID_STATE;
+    // Events go out from the connection on, subscribed or not, as in the reference firmware.
     std::unique_lock<std::mutex> lock(s_control_mtx, std::try_to_lock);
     if (!lock.owns_lock()) return ESP_ERR_NO_MEM;
     const uint16_t mtu = ble_att_mtu(s_conn_handle.load());
@@ -714,7 +714,7 @@ void VoiceSession() {
     ESP_LOGI(TAG, "voice task started (session=%u)", static_cast<unsigned>(s_voice.session_id));
     bool failed = false;
     while (!failed) {
-        if (!SessionAlive(s_voice.epoch) || !s_voice_notify_enabled) {
+        if (!SessionAlive(s_voice.epoch)) {
             s_voice.last_error = ESP_ERR_INVALID_STATE;
             ESP_LOGW(TAG, "voice: link down — stop"); break;
         }
@@ -806,7 +806,7 @@ esp_err_t VoiceStart() {
     // doing any work; a reconnect must never lend its epoch to this open.
     const uint32_t epoch = s_connection_epoch.load(std::memory_order_acquire);
     if (s_voice.active.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;  // already in a session
-    if (!SessionAlive(epoch) || !s_voice_notify_enabled) return ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(epoch)) return ESP_ERR_INVALID_STATE;  // connected is enough (reference firmware)
     const esp_err_t prepared = PrepareVoice();
     if (prepared != ESP_OK) return prepared;
     {   // reset queue + counters
@@ -819,7 +819,7 @@ esp_err_t VoiceStart() {
     s_voice.rejected_writes = 0; s_voice.last_error = ESP_OK;
     s_voice.end_req.store(false, std::memory_order_release);
     s_voice.epoch = epoch;
-    if (!SessionAlive(epoch) || !s_voice_notify_enabled) return ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(epoch)) return ESP_ERR_INVALID_STATE;  // connected is enough (reference firmware)
     s_voice.session_id = ++s_voice_counter;
     s_voice.active.store(true, std::memory_order_release);
     s_voice_wake.Wake();
@@ -1269,7 +1269,7 @@ esp_err_t RecordingStart(const char* name, size_t name_len) {
     const uint32_t epoch = s_connection_epoch.load(std::memory_order_acquire);
     const uint32_t channel_epoch = s_l2cap_epoch.load(std::memory_order_acquire);
     if (s_rec.active.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
-    if (!SessionAlive(epoch) || !s_event_notify_enabled || !s_l2cap_connected) return ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(epoch) || !s_l2cap_connected) return ESP_ERR_INVALID_STATE;
     if ((!name && name_len) || name_len > 128) return ESP_ERR_INVALID_ARG;
     const uint16_t mtu = ble_att_mtu(s_conn_handle.load());
     if (mtu < 78 || name_len + 10 > static_cast<size_t>(mtu - 3)) return ESP_ERR_INVALID_SIZE;
@@ -1291,7 +1291,7 @@ esp_err_t RecordingStart(const char* name, size_t name_len) {
     s_rec.channel_epoch = channel_epoch;
     s_rec.start_name.clear();
     if (name_len) s_rec.start_name.assign(reinterpret_cast<const uint8_t*>(name), reinterpret_cast<const uint8_t*>(name) + name_len);
-    if (!SessionAlive(epoch) || !s_event_notify_enabled || !s_l2cap_connected ||
+    if (!SessionAlive(epoch) || !s_l2cap_connected ||
         channel_epoch != s_l2cap_epoch.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
     s_rec.transfer_id = ++s_rec_counter;
     s_rec.active.store(true, std::memory_order_release);
@@ -1490,7 +1490,7 @@ esp_err_t ImageStart(uint8_t fmt, uint16_t w, uint16_t h, uint32_t total) {
     const uint32_t epoch = s_connection_epoch.load(std::memory_order_acquire);
     const uint32_t channel_epoch = s_img_epoch.load(std::memory_order_acquire);
     if (s_img.active.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;  // one image at a time
-    if (!SessionAlive(epoch) || !s_event_notify_enabled) return ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(epoch)) return ESP_ERR_INVALID_STATE;
     if (fmt > 1) return ESP_ERR_INVALID_ARG;
     if (!s_img_connected) {  // the App must have opened the image L2CAP CoC before we can push
         ESP_LOGD(TAG, "image: L2CAP CoC not open — App must connect PSM 0x%04X first", kImgPsm);
@@ -1512,7 +1512,7 @@ esp_err_t ImageStart(uint8_t fmt, uint16_t w, uint16_t h, uint32_t total) {
     s_img.format = fmt; s_img.width = w; s_img.height = h; s_img.total_len = total;
     s_img.epoch = epoch;
     s_img.channel_epoch = channel_epoch;
-    if (!SessionAlive(epoch) || !s_event_notify_enabled || !s_img_connected ||
+    if (!SessionAlive(epoch) || !s_img_connected ||
         channel_epoch != s_img_epoch.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
     s_img.transfer_id = ++s_img_counter;
     s_img.active.store(true, std::memory_order_release);
@@ -1563,6 +1563,37 @@ esp_err_t ImageEnd(bool complete) {
 
 #endif
 
+// ── Link speed, as in the reference firmware: connection interval -> 2M PHY -> DLE, one step per
+// completion event. The App streams OTA images and minute-long audio over this link, so the
+// default parameters a phone picks are not good enough. Host task only.
+bool s_phy_requested = false;   // one shot per connection, both cleared on (dis)connect
+bool s_dle_requested = false;
+
+void RequestFastConnParams(uint16_t conn_handle) {
+    struct ble_gap_upd_params p;
+    memset(&p, 0, sizeof(p));
+    p.itvl_min = 6;    // 7.5ms
+    p.itvl_max = 12;   // 15ms
+    p.latency = 0;
+    p.supervision_timeout = 400;  // 4s
+    const int rc = ble_gap_update_params(conn_handle, &p);
+    if (rc != 0) ESP_LOGW(TAG, "conn param update request failed: %d", rc);
+    else         ESP_LOGI(TAG, "requested fast conn params (7.5-15ms)");
+}
+
+void RequestTwoMPhy(uint16_t conn_handle) {
+    const int rc = ble_gap_set_prefered_le_phy(conn_handle, BLE_GAP_LE_PHY_2M_MASK,
+                                               BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
+    if (rc != 0) ESP_LOGW(TAG, "2M PHY request failed: %d", rc);
+    else         ESP_LOGI(TAG, "requested 2M PHY");
+}
+
+void RequestDataLen(uint16_t conn_handle) {
+    const int rc = ble_gap_set_data_len(conn_handle, 251, 0x0848);
+    if (rc != 0) ESP_LOGW(TAG, "DLE request failed: %d", rc);
+    else         ESP_LOGI(TAG, "requested max data length (251 octets)");
+}
+
 // GAP events: connect / disconnect / advertising complete.
 int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
     if (s_stopping) {
@@ -1580,6 +1611,9 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
             s_batt_notify_enabled = false;
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "connected (handle=%d)", s_conn_handle.load());
+            // Kick off the link-speed chain; the rest fires from the completion events.
+            s_phy_requested = false; s_dle_requested = false;
+            RequestFastConnParams(event->connect.conn_handle);
             if (!s_stopping) { if (auto cb = s_on_conn.load()) cb(true); }
         } else {
             ESP_LOGW(TAG, "connect failed (status=%d) — re-advertising", event->connect.status);
@@ -1593,6 +1627,7 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
         s_voice_notify_enabled = false;
         s_batt_notify_enabled = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_phy_requested = false; s_dle_requested = false;   // renegotiate on the next connection
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
         s_l2cap_epoch.fetch_add(1); s_img_epoch.fetch_add(1);
         s_l2cap_connected = false; s_l2cap_chan = nullptr;  // L2CAP goes down with the ACL
@@ -1630,16 +1665,10 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
         // are delivered from now on -> tell the core it is "notify-ready" (the core sends the I/O
         // manifest from here, see agent_link.cpp OnLinkReady).
         if (event->subscribe.attr_handle == s_h_evt) {
+            // The connection itself is the session (reference firmware): an unsubscribe only
+            // stops the manifest/event handshake from repeating, it does not retire sessions.
             const bool became_ready = event->subscribe.cur_notify && !s_event_notify_enabled;
-            const bool lost_ready = !event->subscribe.cur_notify && s_event_notify_enabled;
             s_event_notify_enabled = event->subscribe.cur_notify;
-            if (lost_ready) {
-                // Retire old outbound sessions while preserving the physical
-                // CoC receive epoch (an OTA SDU may still be in progress).
-                s_connection_epoch.fetch_add(1);
-                WakeWorkers();
-                if (auto cb = s_on_conn.load()) cb(true);
-            }
             if (became_ready && !s_stopping) {
                 ESP_LOGI(TAG, "peer subscribed 0xFFC4 (event channel) — notify-ready");
                 if (auto cb = s_on_ready.load()) cb();
@@ -1653,6 +1682,20 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
             s_batt_notify_enabled = event->subscribe.cur_notify;
             if (event->subscribe.cur_notify) s_batt_dirty.store(true);
             s_control_wake.Wake();
+        }
+        return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        // Connection interval settled -> next step: 2M PHY.
+        if (!s_phy_requested && s_connected) {
+            s_phy_requested = true;
+            RequestTwoMPhy(s_conn_handle.load());
+        }
+        return 0;
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        // PHY settled -> last step: data length extension.
+        if (!s_dle_requested && s_connected) {
+            s_dle_requested = true;
+            RequestDataLen(s_conn_handle.load());
         }
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -2003,7 +2046,8 @@ esp_err_t ble_stream_end(void*, agent_stream_t type, bool complete, const uint8_
 #endif
     return ESP_ERR_NOT_SUPPORTED;
 }
-bool ble_is_ready(void* /*impl*/) { return s_started && !s_stopping && s_connected && s_event_notify_enabled; }
+// Connected is ready: the reference firmware's backend reports s_connected alone.
+bool ble_is_ready(void* /*impl*/) { return s_started && !s_stopping && s_connected; }
 
 esp_err_t ble_prepare_streams(void*, uint32_t mask) {
     if (!s_started || s_stopping) return ESP_ERR_INVALID_STATE;
@@ -2027,7 +2071,7 @@ esp_err_t ble_stream_status(void*, agent_stream_t type, agent_stream_status_t* o
     if (!out) return ESP_ERR_INVALID_ARG;
     if (type == AGENT_STREAM_VOICE) {
         agentlink::blepolicy::StreamStatus(s_voice, kVoiceQueueHardCap,
-                     s_started && !s_stopping && s_connected && s_voice_notify_enabled,
+                     s_started && !s_stopping && s_connected,
                      s_voice.session_id, out);
         return ESP_OK;
     }

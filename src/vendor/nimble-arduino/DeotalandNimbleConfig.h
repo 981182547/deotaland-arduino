@@ -39,7 +39,7 @@
 #undef CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE
 #define CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 6144
 #undef CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU
-#define CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU 255
+#define CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU 512   // reference firmware sdkconfig.defaults
 
 // These modes are unused by Agent Link. Keep their configuration uniform
 // even when building against an SDK that has different host defaults.

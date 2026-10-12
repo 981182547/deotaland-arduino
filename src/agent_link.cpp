@@ -80,11 +80,14 @@ size_t BoundedLength(const char* text, size_t max) {
 }
 
 size_t BuildDeviceInfo(uint8_t* out, size_t capacity) {
-    if (!dev_identity_uuid(s_device_id)) return 0;
     const size_t vn = s_firmware.size(), mn = s_model.size();
     if (vn > 255 || mn > 255 || 29 + vn + mn > capacity) return 0;
     size_t p = 0;
-    memcpy(out, s_device_id, 16); p += 16;
+    // Like the reference firmware, answer with the nil UUID rather than an
+    // error while no persisted identity exists yet.
+    uint8_t uuid[16] = {};
+    if (!dev_identity_uuid(uuid)) memset(uuid, 0, sizeof(uuid));
+    memcpy(out, uuid, 16); p += 16;
     uint8_t mac[6] = {};
     if (s_cfg.transport == AGENT_TRANSPORT_BLE) agent_transport_ble_get_mac(mac);
     memcpy(out + p, mac, 6); p += 6;
@@ -166,6 +169,30 @@ void LinkStatus(agent_link_phase_t phase, const char* title, const char* hint) {
     agentlink::StatusPush(&status);
 }
 
+// BLE status wording of the reference firmware (PublishBle), which boards draw verbatim.
+void PublishBle(agent_link_phase_t phase) {
+    agent_link_status_t status = {};
+    status.transport = AGENT_TRANSPORT_BLE; status.phase = phase;
+    const char* name = (s_cfg.device_name && s_cfg.device_name[0]) ? s_cfg.device_name : "this device";
+    switch (phase) {
+    case AGENT_LINK_PHASE_SETUP:
+        snprintf(status.title, sizeof(status.title), "Open the app");
+        snprintf(status.hint, sizeof(status.hint), "Open the Deotaland app on your phone and connect to %s", name);
+        break;
+    case AGENT_LINK_PHASE_CONNECTING:
+        snprintf(status.title, sizeof(status.title), "Connecting");
+        snprintf(status.hint, sizeof(status.hint), "Pairing with the app");
+        break;
+    case AGENT_LINK_PHASE_READY:
+        snprintf(status.title, sizeof(status.title), "Connected");
+        snprintf(status.hint, sizeof(status.hint), "Connected to the app");
+        break;
+    default:
+        break;
+    }
+    agentlink::StatusPush(&status);
+}
+
 // The SDK only notifies when the battery level changes / charging state changes / a
 // low-battery edge occurs. The cache is updated only on a successful send; a failed
 // send is retried on the next call.
@@ -173,7 +200,7 @@ int  s_bat_pct = -1;          // last successfully pushed battery level (-1 = un
 int  s_bat_chg = -1;          // last successfully pushed charging state (-1 = unknown; otherwise 0/1)
 int s_bat_current_pct = -1, s_bat_current_chg = -1;
 bool s_bat_low_armed = true;  // low-battery edge armed (true = not yet triggered)
-constexpr uint8_t kBatLowThreshold = 5;  // low-battery threshold (%)
+constexpr uint8_t kBatLowThreshold = 20;  // low-battery threshold (%), as in the reference firmware
 
 // Generic I/O endpoint registry (manifest + reading reports + downlink actuators).
 // Downlink actuator commands are routed by id to the matching cb.
@@ -335,27 +362,31 @@ void SynthHapticCb(const char*, const uint8_t* args, size_t len, void*) {
 
 void SynthScreenCb(const char*, const uint8_t* args, size_t len, void*) {
     if (!(s_have_out && s_out.on_show_text)) return;
-    char buf[256];
+    // Static, as in the reference firmware: an Agent answer runs to ~1 KB.
+    // Actuator callbacks are dispatched one at a time from poll().
+    static char buf[1024];
     const size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
     if (n && args) memcpy(buf, args, n);
     buf[n] = '\0';
     s_out.on_show_text(buf, s_out.ctx);
 }
 
+// Field-for-field the reference firmware's synthetic descriptors: the App sees
+// them verbatim in the 0x18 manifest.
 const agent_link_io_desc_t kSynthLed = {
     "led0", AGENT_IO_OUT, "led", AGENT_VAL_RGB, nullptr,
     "status LED color, 0x00RRGGBB", 0, 0, 0, nullptr,
-    "Status LED", AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
+    nullptr, AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
 };
 const agent_link_io_desc_t kSynthHaptic = {
     "motor0", AGENT_IO_OUT, "haptic", AGENT_VAL_U16, "ms",
-    "vibration motor duration", 0, 65535, 0, nullptr,
-    "Vibration", AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
+    "vibration motor, duration in ms", 0, 0, 0, nullptr,
+    nullptr, AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
 };
 const agent_link_io_desc_t kSynthScreen = {
     "screen0", AGENT_IO_OUT, "screen.text", AGENT_VAL_STR, nullptr,
     "text display", 0, 0, 0, nullptr,
-    "Screen text", AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
+    nullptr, AGENT_AUD_AI, nullptr, nullptr, AGENT_EVT_PERIODIC,
 };
 
 void RegisterSyntheticEndpoints() {
@@ -503,9 +534,14 @@ void PumpManifest() {
 // BLE: fired after the peer subscribes to the event channel 0xFFC4 (notifications are only
 // delivered from that point on) -> send the manifest.
 void OnLinkReady() {
-    // A BLE ACL connection alone cannot carry device events: READY begins when
-    // the peer enables the 0xFFC4 notification channel. WiFi has no data plane.
-    if (s_cfg.transport != AGENT_TRANSPORT_WIFI && s_state != AGENT_STATE_READY) {
+    if (s_cfg.transport == AGENT_TRANSPORT_BLE) {
+        // As in the reference firmware, BLE is already READY from the connection itself; the
+        // subscription only completes the handshake. Cached readings published before it never
+        // reached the App, so offer them again now that it listens.
+        PublishBle(AGENT_LINK_PHASE_READY);
+        for (auto& io : s_io) io.pending = io.has_last;
+    } else if (s_cfg.transport != AGENT_TRANSPORT_WIFI && s_state != AGENT_STATE_READY) {
+        // Custom backends signal their data-plane readiness separately. WiFi has no data plane.
         s_state = AGENT_STATE_READY;
         LinkStatus(AGENT_LINK_PHASE_READY, "Ready", "Connected to the agent");
         if (s_cfg.on_state) s_cfg.on_state(s_state, s_cfg.state_ctx);
@@ -515,9 +551,15 @@ void OnLinkReady() {
 
 // Transport -> core: connection state change.
 void OnConn(bool connected) {
-    // Platform authentication alone does not imply a usable data plane.
-    s_state = connected ? AGENT_STATE_CONNECTED : AGENT_STATE_DISCONNECTED;
-    if (s_cfg.transport != AGENT_TRANSPORT_WIFI)
+    // BLE: the protocol is plaintext with no encryption gate, so — exactly like the reference
+    // firmware — the link is usable as soon as it connects: straight to READY, and commands on
+    // 0xFFC1 are handled and answered from then on. WiFi platform authentication alone does not
+    // imply a usable data plane, and custom backends report readiness separately.
+    const bool ble = s_cfg.transport == AGENT_TRANSPORT_BLE;
+    s_state = !connected ? AGENT_STATE_DISCONNECTED : ble ? AGENT_STATE_READY : AGENT_STATE_CONNECTED;
+    if (ble)
+        PublishBle(connected ? AGENT_LINK_PHASE_CONNECTING : AGENT_LINK_PHASE_SETUP);
+    else if (s_cfg.transport != AGENT_TRANSPORT_WIFI)
         LinkStatus(connected ? AGENT_LINK_PHASE_CONNECTED : AGENT_LINK_PHASE_SETUP,
                    connected ? "Connected" : "Set up link",
                    connected ? "Waiting for the event channel" : "Open the App to connect");
@@ -525,9 +567,9 @@ void OnConn(bool connected) {
     s_response_size = 0;
     for (auto& stream : s_streams) stream.open = false;
     for (auto& pending : s_pending_stream_end) pending=false;
+    // Reporting policies set by 0x36 persist across connections, as in the reference firmware.
     for (auto& io : s_io) {
         io.has_sent = false; io.last_sent_ms = 0;
-        io.policy_mode=IO_POLICY_PASSTHROUGH; io.policy_rate_hz=0;
         io.pending=io.has_last;
     }
     agentlink::ota::OnLinkState(connected);
@@ -576,27 +618,32 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
     uint8_t  status = 0;   // 0 = success
     uint16_t error  = 0;
 
+    // Acceptance rules below follow the reference firmware command for command: the App was
+    // written against it, so a payload it tolerates must not be refused here.
     if (f.command_id == 0x01) {
-        if (!f.payload.empty()) { status=1; error=1004; }
-        else extra_len = BuildDeviceInfo(extra,sizeof(extra));
-        if (!status && !extra_len) { status=1; error=1005; }
-        else if (!status) extra[22] = s_bat_current_pct >= 0 ? static_cast<uint8_t>(s_bat_current_pct) : 0;
+        // 0x01 RequestDeviceInfo. Payload is ignored.
+        extra_len = BuildDeviceInfo(extra,sizeof(extra));
+        if (!extra_len) { status=1; error=1005; }   // response buffer too small
+        else extra[22] = s_bat_current_pct >= 0 ? static_cast<uint8_t>(s_bat_current_pct) : 0;
     } else if (f.command_id == 0x37) {
+        // 0x37 StartOtaUpgrade: size(4) + sha256(32) + ver_len(1) + version [+ model_len(1) + model].
         const auto& p = f.payload;
-        if (!s_cfg.enable_ota || s_cfg.transport != AGENT_TRANSPORT_BLE || !agent_transport_ble_l2cap_ready()) {
-            status = 1; error = 1003;
-        } else if (p.size() < 38 || p[36] == 0 || p[36] > 31 || p.size() < size_t(37 + p[36])) {
-            status = 1; error = 1004;
+        if (p.size() < 38 || p[36] == 0 || p.size() < size_t(37 + p[36])) {
+            status = 1; error = agentlink::ota::kErrInvalidPayload;
         } else {
             const size_t end = 37 + p[36];
             char ver[32]={}, model[40]={};
-            memcpy(ver,p.data()+37,p[36]);
-            if (p.size() > end) {
-                if (!p[end] || p[end] > 39 || p.size() != end+1+p[end]) { status=1; error=1004; }
-                else memcpy(model,p.data()+end+1,p[end]);
+            memcpy(ver,p.data()+37,p[36] < sizeof(ver) ? p[36] : sizeof(ver)-1);
+            if (p.size() > end) {   // optional trailing model section
+                if (!p[end] || p.size() != end+1+p[end]) { status=1; error=agentlink::ota::kErrInvalidPayload; }
+                else memcpy(model,p.data()+end+1,p[end] < sizeof(model) ? p[end] : sizeof(model)-1);
+            }
+            if (!status && (!s_cfg.enable_ota || s_cfg.transport != AGENT_TRANSPORT_BLE ||
+                            !agent_transport_ble_l2cap_ready())) {
+                // The image arrives on CoC 0x0081 only; it must be open (and OTA enabled here).
+                status = 1; error = agentlink::ota::kErrBusinessFailed;
             }
             const uint32_t bytes = uint32_t(p[0]) | (uint32_t(p[1])<<8) | (uint32_t(p[2])<<16) | (uint32_t(p[3])<<24);
-            if (!status && (memchr(p.data()+37,0,p[36]) || (p.size()>end && memchr(p.data()+end+1,0,p[end])))) { status=1; error=1004; }
             if (!status && !agentlink::ota::Start(bytes,p.data()+4,ver,model[0]?model:nullptr,&error)) status=1;
         }
     } else if (f.command_id == 0x56) {
@@ -616,8 +663,7 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
         // 0x33 IoActuate: payload = [id_len(1)][id(UTF-8)][args...], routed by id to the registered actuator cb.
         const auto& pl = f.payload;
         char io_id[64];
-        if (pl.empty() || pl[0] == 0 || pl[0] >= sizeof(io_id) || 1u + pl[0] > pl.size() ||
-            memchr(pl.data()+1,0,pl[0])) {
+        if (pl.empty() || pl[0] == 0 || pl[0] >= sizeof(io_id) || 1u + pl[0] > pl.size()) {
             status = 1; error = 1004;  // InvalidPayload
         } else {
             const uint8_t id_len = pl[0];
@@ -627,10 +673,8 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
             if (e && e->desc->dir == AGENT_IO_OUT && e->cb) {
                 const uint8_t* args     = pl.data() + 1 + id_len;
                 const size_t   args_len = pl.size() - 1 - id_len;
-                if (ValidateIoValue(e->desc->value, args, args_len) != ESP_OK ||
-                    (e->cb == SynthScreenCb && args_len > 255)) {
-                    status=1; error=1004;
-                } else e->cb(io_id, args, args_len, e->ctx);
+                // Arguments reach the callback as sent, like the reference firmware.
+                e->cb(io_id, args, args_len, e->ctx);
                 ESP_LOGI(TAG, "actuate '%s' (%uB args)", io_id, static_cast<unsigned>(args_len));
             } else {
                 status = 1; error = 1003;  // BusinessFailed: unknown or non-actuatable id
@@ -639,14 +683,12 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
         }
     } else if (f.command_id == 0x34) {
         // 0x34 GetIoManifest: App-initiated fetch -> (re)send the manifest (0x18), then reply with the usual ACK.
-        if (!f.payload.empty()) { status=1; error=1004; }
-        else SendManifest(/*force=*/true);
+        SendManifest(/*force=*/true);
     } else if (f.command_id == 0x35) {
         // GetReading: [id_len][id] -> [type][age_ms LE][cached value].
         const auto& pl = f.payload;
         char io_id[64];
-        if (pl.empty() || pl[0] == 0 || pl[0] >= sizeof(io_id) || 1u + pl[0] != pl.size() ||
-            memchr(pl.data()+1,0,pl[0])) {
+        if (pl.empty() || pl[0] == 0 || pl[0] >= sizeof(io_id) || 1u + pl[0] > pl.size()) {
             status = 1; error = 1004;
         } else {
             memcpy(io_id, pl.data() + 1, pl[0]);
@@ -672,8 +714,7 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
         const auto& pl = f.payload;
         char io_id[64];
         if (pl.empty() || pl[0] == 0 || pl[0] >= sizeof(io_id) ||
-            (pl.size() != static_cast<size_t>(2 + pl[0]) && pl.size() != static_cast<size_t>(4 + pl[0])) ||
-            memchr(pl.data()+1,0,pl[0])) {
+            static_cast<size_t>(2 + pl[0]) > pl.size()) {
             status = 1; error = 1004;
         } else {
             const uint8_t id_len = pl[0];
@@ -688,7 +729,8 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
             const int idx = FindIoIndex(io_id);
             if (idx < 0 || s_io[idx].desc->dir != AGENT_IO_IN) {
                 status = 1; error = 1003;
-            } else if (mode > IO_POLICY_ONCHANGE || (mode == IO_POLICY_PERIODIC && rate == 0)) {
+            } else if (mode > IO_POLICY_ONCHANGE) {
+                // PERIODIC at 0 Hz is accepted, as by the reference firmware: no throttling.
                 status = 1; error = 1004;
             } else {
                 s_io[idx].policy_mode = mode;
@@ -701,9 +743,9 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
             }
         }
     } else if (f.command_id == 0x3C) {
-        // StartCapture: [mode][max_ms LE]. The board owns microphone capture.
-        if (f.payload.size() != 3) { status=1; error=1004; }
-        else if (!(s_cfg.caps & AGENT_CAP_MIC) || !(s_have_out && s_out.on_listen)) {
+        // StartCapture: [mode][max_ms LE]. The board owns microphone capture. Any payload length
+        // is accepted; max_ms is read when present (reference firmware behavior).
+        if (!(s_cfg.caps & AGENT_CAP_MIC) || !(s_have_out && s_out.on_listen)) {
             status = 1; error = 1002;
         } else {
             uint32_t max_ms = 0;
@@ -714,8 +756,8 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
             s_out.on_listen(true, max_ms, s_out.ctx);
         }
     } else if (f.command_id == 0x3D) {
-        if (!f.payload.empty()) { status=1; error=1004; }
-        else if (s_have_out && s_out.on_listen) s_out.on_listen(false, 0, s_out.ctx);
+        // StopCapture -> on_listen(false, 0); payload ignored.
+        if (s_have_out && s_out.on_listen) s_out.on_listen(false, 0, s_out.ctx);
     } else if (f.command_id == 0x05) {
         // VoiceReply is handled below after its fixed payload has been checked.
         // Keep it out of on_command: it is an SDK protocol command.
@@ -871,7 +913,8 @@ esp_err_t agent_link_start(void) {
     agentlink::RxEnable(true);
     s_generation=agentlink::RxGeneration();
     s_running=true;
-    LinkStatus(AGENT_LINK_PHASE_SETUP, "Set up link", "Open the App or join the device hotspot");
+    if (s_cfg.transport == AGENT_TRANSPORT_BLE) PublishBle(AGENT_LINK_PHASE_SETUP);
+    else LinkStatus(AGENT_LINK_PHASE_SETUP, "Set up link", "Open the App or join the device hotspot");
     const esp_err_t e=s_tx->start(s_tx->impl);
     if (e!=ESP_OK) { s_running=false; agentlink::RxEnable(false); agentlink::StatusReset(s_cfg.transport); }
     return e;
@@ -1104,8 +1147,7 @@ esp_err_t agent_link_report_selected_agent(const char* agent_id) {
 esp_err_t agent_link_push_event(agent_event_t type, const uint8_t* data, size_t len) {
     if (len > 0 && !data) return ESP_ERR_INVALID_ARG;
     if (len > UINT16_MAX || len > PayloadBudget()) return ESP_ERR_INVALID_SIZE;
-    if (type != AGENT_EVT_PROMPT && type != AGENT_EVT_BUTTON && type != AGENT_EVT_SENSOR &&
-        type != AGENT_EVT_WAKEWORD && type != AGENT_EVT_CUSTOM) return ESP_ERR_INVALID_ARG;
+    // Any event id goes on the wire as given, as in the reference firmware.
     if (!s_tx || !s_tx->send_ctrl) return ESP_ERR_INVALID_STATE;
     if (!(s_tx->is_ready && s_tx->is_ready(s_tx->impl))) return not_ready("push_event");
     return SendReliableServiceEvent(static_cast<uint8_t>(type),data,len);
@@ -1139,8 +1181,9 @@ esp_err_t agent_link_register_io(const agent_link_io_desc_t* desc,
     ESP_LOGI(TAG, "register_io[%d]: id='%s' kind='%s' dir=%s",
              s_io_count, desc->id, desc->kind, desc->dir == AGENT_IO_OUT ? "out" : "in");
     s_io_count++;
-    s_manifest_sent=false;
-    if (s_running) (void)agent_link_notify_manifest_changed();
+    // Like the reference firmware, registering does not announce anything by itself: the endpoint
+    // is in the next manifest the App receives (0xFFC4 subscribe or 0x34 fetch). Call
+    // agent_link_notify_manifest_changed() to push a runtime change.
     // The manifest is serialized and sent during the connection handshake (BLE: after the 0xFFC4
     // subscribe; WiFi: after connect), see SendManifest. Downlink actuator commands (0x33) are
     // matched by id to s_io[].cb, see OnCtrlFrame.
@@ -1199,10 +1242,10 @@ void PumpReading() {
         s_reading_cursor%=static_cast<unsigned>(s_io_count);
         auto& e=s_io[s_reading_cursor++];
         if(!e.has_last || e.desc->dir!=AGENT_IO_IN || e.policy_mode==IO_POLICY_OFF) continue;
-        if(e.policy_mode==IO_POLICY_PERIODIC) {
+        if(e.policy_mode==IO_POLICY_PERIODIC && e.policy_rate_hz) {
             const uint32_t period=(1000u+e.policy_rate_hz-1u)/e.policy_rate_hz;
             if(e.has_sent && uint32_t(agent_link_now_ms()-e.last_sent_ms)<period) continue;
-        } else if(!e.pending) continue;
+        } else if(!e.pending) continue;  // PERIODIC at 0 Hz is unthrottled: send new samples only
         const esp_err_t result=SendReading(e,e.last_val,e.last_len);
         if(result==ESP_OK) e.pending=false;
         else {

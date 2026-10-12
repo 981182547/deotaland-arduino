@@ -584,7 +584,7 @@ void printDiagnostic() {
                 (unsigned long long)capturedBytes, (unsigned long long)playedBytes,
                 unsigned(audio.playbackBytes()), (unsigned long)droppedFrames,
                 (unsigned long)uploadedImages);
-  Serial.printf("heap=%u, PSRAM=%u; READY needs 0xFFC4, VOICE needs 0xFFA1; CoC PSM 81/82\n",
+  Serial.printf("heap=%u, PSRAM=%u; READY on BLE connect; CoC PSM 81/82\n",
                 unsigned(ESP.getFreeHeap()), unsigned(ESP.getFreePsram()));
   if (AIOT_USE_WIFI) Serial.println("WiFi: provisioning/cloud only; no Agent media data plane.");
 }
