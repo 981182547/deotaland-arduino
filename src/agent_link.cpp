@@ -58,6 +58,9 @@ bool s_pending_stream_end[AGENT_STREAM_KIND_COUNT] = {};
 bool s_pending_stream_complete[AGENT_STREAM_KIND_COUNT] = {};
 uint8_t s_response[10 + AGENT_LINK_CMD_RESP_MAX];
 size_t s_response_size = 0;
+// 0x34 answers only after the manifest it asked for is out, as the reference firmware's
+// synchronous SendManifest does.
+bool s_response_after_manifest = false;
 agentlink::RxEvent s_rx_event;
 size_t s_rx_offset = 0;
 bool s_rx_pending = false;
@@ -491,6 +494,7 @@ void BuildManifestStep() {
 // Triggered: after the BLE peer subscribes to 0xFFC4 (OnLinkReady) / after WiFi connects (OnConn) /
 //   on the App's 0x34 fetch command.
 void SendManifest(bool force) {
+    if (s_io_count == 0) return;                    // no endpoints: no manifest (reference firmware)
     if (!s_tx || (!force && s_manifest_sent)) return;
     // Repeated fetches of the same revision must not restart an in-flight build.
     if ((s_manifest_building || !s_manifest.empty()) && s_manifest_build_revision==s_manifest_rev) return;
@@ -531,6 +535,17 @@ void PumpManifest() {
     if (s_manifest_offset == s_manifest.size()) { s_manifest_sent = true; s_manifest.clear(); }
 }
 
+// A manifest is still on its way out. The reference firmware sends it synchronously, so no later
+// command is handled (or 0x34 answered) before its last chunk; poll() keeps that order with this.
+// A manifest that cannot go out (link down, too big for this MTU) holds nothing up.
+bool ManifestPending() {
+    if (!Ready()) return false;
+    if (s_manifest_building) return true;
+    if (s_manifest.empty()) return false;
+    const size_t payload = PayloadBudget();
+    return payload > 2 && s_manifest.size() <= std::min(payload - 2, size_t(480)) * 256;
+}
+
 // BLE: fired after the peer subscribes to the event channel 0xFFC4 (notifications are only
 // delivered from that point on) -> send the manifest.
 void OnLinkReady() {
@@ -564,7 +579,7 @@ void OnConn(bool connected) {
                    connected ? "Connected" : "Set up link",
                    connected ? "Waiting for the event channel" : "Open the App to connect");
     s_manifest.clear(); s_manifest_building=false;
-    s_response_size = 0;
+    s_response_size = 0; s_response_after_manifest = false;
     for (auto& stream : s_streams) stream.open = false;
     for (auto& pending : s_pending_stream_end) pending=false;
     // Reporting policies set by 0x36 persist across connections, as in the reference firmware.
@@ -595,7 +610,9 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
         ESP_LOGW(TAG, "bad ctrl frame (%u bytes)", static_cast<unsigned>(len));
         return;
     }
-    if (f.encrypted || f.msg_type != agentlink::kMsgCommand) return;  // the device side only handles "commands"
+    // The encrypted flag is not acted on: like the reference firmware, such a command is handled
+    // and answered as plaintext rather than dropped without a reply.
+    if (f.msg_type != agentlink::kMsgCommand) return;  // the device side only handles "commands"
 
     const bool voice_replay = f.command_id==0x05 && s_voice_reply_seen &&
         f.sequence==s_voice_reply_sequence && f.payload.size()==s_voice_reply_length &&
@@ -794,6 +811,7 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
     // Reply (request-response pairing); a query command carrying extra_data returns its data to the App here.
     s_response_size = agentlink::EncodeResponse(s_response,sizeof(s_response),f.command_id,
         f.sequence,status,error,extra_len ? extra : nullptr,extra_len);
+    s_response_after_manifest = f.command_id == 0x34;
 }
 
 // Transport -> core: a data-plane chunk arrived (e.g. downlink TTS voice over L2CAP).
@@ -932,7 +950,7 @@ void agent_link_stop(void) {
     agentlink::StatusReset(s_cfg.transport);
     for(auto& stream:s_streams) stream.open=false;
     for(auto& pending:s_pending_stream_end) pending=false;
-    s_manifest.clear(); s_manifest_building=false; s_manifest_sent=false; s_response_size=0;
+    s_manifest.clear(); s_manifest_building=false; s_manifest_sent=false; s_response_size=0; s_response_after_manifest=false;
     agentlink::audio::OnLinkState(false);
     s_audio_end_pending=false;
     s_voice_reply_seen=false;
@@ -995,8 +1013,10 @@ size_t agent_link_poll(size_t budget) {
 }
 namespace {
 void RetryResponse(bool& blocked) {
-    if(s_generation!=agentlink::RxGeneration()) { s_response_size=0; return; }
+    if(s_generation!=agentlink::RxGeneration()) { s_response_size=0; s_response_after_manifest=false; return; }
     if(!s_response_size || blocked) return;
+    if(s_response_after_manifest && ManifestPending()) return;
+    s_response_after_manifest=false;
     const esp_err_t e=SendControl(s_response,s_response_size);
     if(e==ESP_ERR_NO_MEM || e==ESP_ERR_TIMEOUT) {
         ++s_stats.tx_retries; ++s_stats.control_backpressure; blocked=true;
@@ -1015,11 +1035,11 @@ bool PumpRx(bool& response_blocked) {
     // A response fences the NEXT command, not independent media already queued
     // after the command we handled. Never overtake an unhandled command or END.
     if(event.kind==agentlink::RxKind::Control) {
-        if(s_response_size) return false;
+        if(s_response_size || ManifestPending()) return false;
         if(s_audio_end_pending) {
             agentlink::FrameView f;
             const bool start=agentlink::ParseFrameView(event.data,event.length,f) &&
-                !f.encrypted && f.msg_type==agentlink::kMsgCommand && f.command_id==0x05 &&
+                f.msg_type==agentlink::kMsgCommand && f.command_id==0x05 &&
                 (f.payload.size()==5 || (f.payload.size()==6 && f.payload[5]<=agentlink::audio::kCodecImaAdpcm)) &&
                 f.payload[4]==2;
             if(start) return false; // Other control remains usable while the speaker drains.
@@ -1057,7 +1077,7 @@ size_t agent_link_poll_budget(size_t budget, uint32_t max_us) {
     const uint32_t started=agent_link_now_us();
     const auto expired=[&]() { return max_us && uint32_t(agent_link_now_us()-started)>=max_us; };
     if(s_generation!=agentlink::RxGeneration()) {
-        s_response_size=0; s_rx_pending=false;
+        s_response_size=0; s_response_after_manifest=false; s_rx_pending=false;
         agentlink::audio::OnLinkState(false);
         s_audio_end_pending=s_audio_finished=false;
         s_voice_reply_seen=false;
@@ -1090,7 +1110,7 @@ size_t agent_link_poll_budget(size_t budget, uint32_t max_us) {
             if(agentlink::StatusTake(&status) && s_cfg.on_status) s_cfg.on_status(&status,s_cfg.status_ctx);
             break;
         }
-        case 6: if(!s_response_size || s_manifest_building) PumpManifest(); break;
+        case 6: if(!s_response_size || s_manifest_building || s_response_after_manifest) PumpManifest(); break;
         case 7: PumpReading(); break;
         case 8: rx_available=PumpRx(response_blocked); if(rx_available) ++done; break;
         }
